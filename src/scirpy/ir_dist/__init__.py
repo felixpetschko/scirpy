@@ -41,9 +41,10 @@ MetricType = (
         "identity",
         "levenshtein",
         "hamming",
-        "gpu_haming",
+        "gpu_hamming",
         "normalized_hamming",
         "tcrdist",
+        "gpu_tcrdist",
     ]
     | metrics.DistanceCalculator
 )
@@ -120,6 +121,8 @@ def _get_distance_calculator(metric: MetricType, cutoff: int | None, *, n_jobs=-
         dist_calc = metrics.GPUHammingDistanceCalculator(**kwargs)
     elif metric == "tcrdist":
         dist_calc = metrics.TCRdistDistanceCalculator(n_jobs=n_jobs, **kwargs)
+    elif metric == "gpu_tcrdist":
+        dist_calc = metrics.GPUTCRdistDistanceCalculator(**kwargs)
     else:
         raise ValueError("Invalid distance metric.")
 
