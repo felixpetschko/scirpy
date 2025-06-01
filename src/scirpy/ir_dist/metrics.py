@@ -1520,7 +1520,7 @@ class GPUTCRdistDistanceCalculator(_MetricDistanceCalculator):
             const int* __restrict__ seqs_original_indices,
             const int* seqs2_original_indices,
             const int cutoff,
-            char* __restrict__ data,
+            int* __restrict__ data,
             int* __restrict__ indices,
             int* __restrict__ row_element_counts,
             const int block_offset,
@@ -1545,10 +1545,10 @@ class GPUTCRdistDistanceCalculator(_MetricDistanceCalculator):
                 for (int col = 0; col < seqs_mat2_rows; col++) {
                     if ((! is_symmetric ) || (col + block_offset) >= row) {
                         int seq2_len = seqs_L2[col];
-                        char distance = 1;
+                        int distance = 1;
 
                         if (seq1_len == seq2_len) {
-                            for (int i = 0; i < seq1_len; i++) {
+                            for (int i = ntrim; i < (seq1_len-ctrim); i++) {
                                 char val1 = seqs_mat1[i*seqs_mat1_rows+row];
                                 char val2 = seqs_mat2[i*seqs_mat2_rows+col];
                                 distance += aa_distance_matrix[val1 * 24 + val2];
@@ -1572,7 +1572,7 @@ class GPUTCRdistDistanceCalculator(_MetricDistanceCalculator):
                                 char val2 = seqs_mat2[j*seqs_mat2_rows+col];
                                 distance += aa_distance_matrix[val1 * 24 + val2];
                             }
-                            distance += gap_penalty * len_diff;
+                            distance += gap_penalty * len_diff;                           
                         }
                         if (distance <= cutoff + 1) {
                             int seqs2_original_index = seqs2_original_indices[col];
@@ -1596,7 +1596,7 @@ class GPUTCRdistDistanceCalculator(_MetricDistanceCalculator):
         extern "C" __global__
         void create_csr_kernel(
             int* data, int* indices,
-            char* data_matrix, int* indices_matrix,
+            int* data_matrix, int* indices_matrix,
             int* indptr, int data_matrix_rows, int data_matrix_cols, int data_rows, int indices_matrix_cols
         ) {
             int row = blockDim.x * blockIdx.x + threadIdx.x;
@@ -1634,7 +1634,7 @@ class GPUTCRdistDistanceCalculator(_MetricDistanceCalculator):
             # set a maximum result width for the current block
             max_block_width = self.gpu_block_width
 
-            d_data_matrix = cp.empty((seqs_mat1.shape[0], max_block_width), dtype=cp.int8)
+            d_data_matrix = cp.empty((seqs_mat1.shape[0], max_block_width), dtype=cp.int32)
             d_indices_matrix = cp.empty((seqs_mat1.shape[0], max_block_width), dtype=np.int32)
             d_row_element_counts = cp.zeros(seqs_mat1.shape[0], dtype=np.int32)
 
