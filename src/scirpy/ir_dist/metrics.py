@@ -826,15 +826,13 @@ class HashbasedHammingDistanceCalculator(_MetricDistanceCalculator):
         num_partitions = self.cutoff + 1
 
         buckets = self._create_buckets(seqs2, num_partitions)
-        start_column *= is_symmetric
 
         data_rows = []
         indices_rows = []
         row_element_counts = np.empty(len(seqs), dtype=np.int64)
 
         for i, seq in enumerate(seqs):
-            min_column = start_column + i * is_symmetric
-            candidates = sorted(candidate_idx for candidate_idx in self._get_candidates(seq, buckets, num_partitions) if candidate_idx >= min_column)
+            candidates = sorted(self._get_candidates(seq, buckets, num_partitions))
             data_row = np.empty(len(candidates))
             indices_row = np.empty(len(candidates), dtype=np.int64)
             row_end_index = 0
