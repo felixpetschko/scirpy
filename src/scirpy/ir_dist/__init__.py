@@ -115,6 +115,8 @@ def _get_distance_calculator(metric: MetricType, cutoff: int | None, *, n_jobs=-
         dist_calc = metrics.HammingDistanceCalculator(n_jobs=n_jobs, normalize=True, **kwargs)
     elif metric == "gpu_hamming":
         dist_calc = metrics.GPUHammingDistanceCalculator(**kwargs)
+    elif metric == "hashbased_hamming":
+        dist_calc = metrics.HashbasedHammingDistanceCalculator(**kwargs)
     elif metric == "tcrdist":
         dist_calc = metrics.TCRdistDistanceCalculator(n_jobs=n_jobs, **kwargs)
     else:

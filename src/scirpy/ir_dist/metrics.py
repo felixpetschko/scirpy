@@ -2,6 +2,7 @@ import abc
 import itertools
 import warnings
 from collections.abc import Sequence
+from collections import defaultdict
 
 import joblib
 import matplotlib.pyplot as plt
@@ -750,6 +751,108 @@ class HammingDistanceCalculator(_MetricDistanceCalculator):
         return data_rows, indices_rows, row_element_counts, row_mins
 
     _metric_mat = _hamming_mat
+
+
+class HashbasedHammingDistanceCalculator(_MetricDistanceCalculator):
+    """Computes pairwise distances between gene sequences based on a hash-accelerated hamming distance metric.
+
+    This implementation follows the same sparse-matrix contract as :class:`HammingDistanceCalculator`, but reduces
+    the candidate search space by indexing contiguous sequence blocks. For sequences with hamming distance
+    ``<= cutoff``, at least one of ``cutoff + 1`` blocks must match exactly, which is used as a filter before the
+    exact hamming distance is computed.
+
+    Parameters
+    ----------
+    cutoff:
+        Will eleminate distances > cutoff to make efficient use of sparse matrices.
+    n_jobs:
+        Kept for API compatibility with other calculators using :class:`_MetricDistanceCalculator`.
+        Parallelization is controlled via ``n_blocks``.
+    n_blocks:
+        Number of joblib delayed objects (blocks to compute) given to joblib.Parallel
+    histogram:
+        Not implemented for the hash-based calculator.
+    """
+
+    def __init__(
+        self,
+        n_jobs: int = -1,
+        n_blocks: int = 1,
+        cutoff: int = 2,
+        *,
+        histogram: bool = False,
+    ):
+        super().__init__(n_jobs=n_jobs, n_blocks=n_blocks, histogram=histogram)
+        self.cutoff = cutoff
+
+    @staticmethod
+    def _build_hash_keys(seq: str, num_partitions: int) -> list[str]:
+        n = len(seq)
+        return [seq[i::num_partitions] + str(n) for i in range(num_partitions)]
+
+    @staticmethod
+    def _create_buckets(seqs: list[str], num_partitions: int) -> list[defaultdict[str, list[int]]]:
+        buckets = [defaultdict(list) for _ in range(num_partitions)]
+        for seq_idx, seq in enumerate(seqs):
+            hash_keys = HashbasedHammingDistanceCalculator._build_hash_keys(seq, num_partitions)
+            for bucket_idx, hash_key in enumerate(hash_keys):
+                buckets[bucket_idx][hash_key].append(seq_idx)
+        return buckets
+
+    @staticmethod
+    def _get_candidates(seq: str, buckets: list[defaultdict[str, list[int]]], num_partitions: int) -> set[int]:
+        hash_keys = HashbasedHammingDistanceCalculator._build_hash_keys(seq, num_partitions)
+        candidates = set()
+        for bucket_idx, hash_key in enumerate(hash_keys):
+            bucket_candidates = buckets[bucket_idx][hash_key]
+            candidates.update(bucket_candidates)
+        return candidates
+
+    @staticmethod
+    def _hamming(a: str, b: str):
+        return sum(c1 != c2 for c1, c2 in zip(a, b))
+
+    def _hash_based_hamming_mat(
+        self,
+        *,
+        seqs: Sequence[str],
+        seqs2: Sequence[str],
+        is_symmetric: bool = False,
+        start_column: int = 0,
+    ) -> tuple[list[np.ndarray], list[np.ndarray], np.ndarray, np.ndarray]:
+        if self.histogram:
+            raise NotImplementedError("Creating a histogram is not implemented for the hash-based hamming metric")
+
+        num_partitions = self.cutoff + 1
+
+        buckets = self._create_buckets(seqs2, num_partitions)
+        start_column *= is_symmetric
+
+        data_rows = []
+        indices_rows = []
+        row_element_counts = np.empty(len(seqs), dtype=np.int64)
+
+        for i, seq in enumerate(seqs):
+            min_column = start_column + i * is_symmetric
+            candidates = sorted(candidate_idx for candidate_idx in self._get_candidates(seq, buckets, num_partitions) if candidate_idx >= min_column)
+            data_row = np.empty(len(candidates))
+            indices_row = np.empty(len(candidates), dtype=np.int64)
+            row_end_index = 0
+
+            for candidate_idx in candidates:
+                hamming_distance = self._hamming(seq, seqs2[candidate_idx])
+                if hamming_distance <= self.cutoff:
+                    data_row[row_end_index] = hamming_distance + 1
+                    indices_row[row_end_index] = candidate_idx
+                    row_end_index += 1
+
+            row_element_counts[i] = row_end_index
+            data_rows.append(data_row[:row_end_index].copy())
+            indices_rows.append(indices_row[:row_end_index].copy())
+
+        return data_rows, indices_rows, row_element_counts, np.array([None])
+
+    _metric_mat = _hash_based_hamming_mat
 
 
 class GPUHammingDistanceCalculator(_MetricDistanceCalculator):

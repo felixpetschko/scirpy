@@ -12,6 +12,7 @@ from scirpy.ir_dist.metrics import (
     FastAlignmentDistanceCalculator,
     GPUHammingDistanceCalculator,
     HammingDistanceCalculator,
+    HashbasedHammingDistanceCalculator,
     IdentityDistanceCalculator,
     LevenshteinDistanceCalculator,
     ParallelDistanceCalculator,
@@ -217,6 +218,37 @@ def test_hamming_dist():
         res.toarray(),
         np.array([[0, 0], [0, 2], [0, 0], [3, 0], [0, 0]]),
     )
+
+
+def test_hashbased_hamming_dist_matches_hamming():
+    seqs = np.array(["", "A", "AA", "AAA", "AAR", "ABA", "ZZZZZZ"])
+    seqs2 = np.array(["", "RRR", "AR", "AAA", "ABA", "ZZZZZZ"])
+
+    hamming = HammingDistanceCalculator(cutoff=2)
+    hashbased = HashbasedHammingDistanceCalculator(cutoff=2)
+
+    expected = hamming.calc_dist_mat(seqs, seqs2)
+    result = hashbased.calc_dist_mat(seqs, seqs2)
+
+    assert isinstance(result, scipy.sparse.csr_matrix)
+    assert result.shape == expected.shape
+    assert np.array_equal(result.toarray(), expected.toarray())
+
+
+def test_hashbased_hamming_reference():
+    from . import TESTDATA
+
+    seqs = np.load(TESTDATA / "hamming_test_data/hamming_WU3k_seqs.npy")
+
+    hamming_calculator = HammingDistanceCalculator(2, 2, 2)
+    hashbased_calculator = HashbasedHammingDistanceCalculator(2, 2, 2)
+
+    expected = hamming_calculator.calc_dist_mat(seqs, seqs)
+    result = hashbased_calculator.calc_dist_mat(seqs, seqs)
+
+    assert np.array_equal(result.data, expected.data)
+    assert np.array_equal(result.indices, expected.indices)
+    assert np.array_equal(result.indptr, expected.indptr)
 
 
 @pytest.mark.extra
