@@ -848,8 +848,11 @@ class HashbasedHammingDistanceCalculator(_MetricDistanceCalculator):
         unique_characters = "".join({char for string in (*seqs, *seqs2) for char in string})
         max_seq_len = max(len(s) for s in (*seqs, *seqs2))
 
+        s=time.time()
         seqs_mat1, seqs_L1 = _seqs2mat(seqs, alphabet=unique_characters, max_len=max_seq_len)
         seqs_mat2, seqs_L2 = _seqs2mat(seqs2, alphabet=unique_characters, max_len=max_seq_len)
+        e=time.time()
+        print("convert matrices time taken: ", e-s)
         
         s=time.time()
         buckets = self._create_buckets(seqs2, num_partitions)
@@ -875,18 +878,26 @@ class HashbasedHammingDistanceCalculator(_MetricDistanceCalculator):
 
         @nb.njit(cache=True)
         def _hamming_nb(hashkeys_per_sequence, buckets):
-            for i in range(len(hashkeys_per_sequence)):
+            num_rows = len(hashkeys_per_sequence)
+            data_rows = nb.typed.List()
+            indices_rows = nb.typed.List()
+            row_element_counts = np.zeros(num_rows, dtype=np.int64)
+
+            for i in range(num_rows):
                 seq1 = seqs_mat1[i]
                 seq1_len = len(seq1)
                 hashkey_list = hashkeys_per_sequence[i]
+
                 candidates_raw = []
                 num_candidates = 0
                 for k in range(len(hashkey_list)):
                     bucket = buckets[k]
                     hashkey = hashkey_list[k]
-                    candidates = bucket[hashkey]
-                    candidates_raw.append(candidates)
-                    num_candidates += len(candidates)
+                    if hashkey in bucket:
+                        candidates = bucket[hashkey]
+                        candidates_raw.append(candidates)
+                        num_candidates += len(candidates)
+
                 candidates_arr = np.empty(num_candidates, dtype=np.int64)
                 candidates_arr_pointer = 0
                 for c in candidates_raw:
@@ -894,46 +905,40 @@ class HashbasedHammingDistanceCalculator(_MetricDistanceCalculator):
                     candidates_arr[candidates_arr_pointer:candidates_arr_pointer + num_elements] = c
                     candidates_arr_pointer += num_elements
 
-                candidates_arr.sort()
-                
+                if num_candidates > 0:
+                    candidates_arr.sort()
+
+                data_row = np.empty(num_candidates, dtype=np.uint8)
+                indices_row = np.empty(num_candidates, dtype=np.int64)
+                row_end_index = 0
+
                 for idx in range(len(candidates_arr)):
                     if idx > 0 and candidates_arr[idx] == candidates_arr[idx - 1]:
                         continue
+
                     candidate = candidates_arr[idx]
-                    seq2 = seqs_mat1[candidate]
+                    seq2 = seqs_mat2[candidate]
                     distance = 1
-                    for j in range(0, seq1_len):
+                    for j in range(seq1_len):
                         distance += seq1[j] != seq2[j]
-                    if(distance>100):
-                        print("test")
-                        
-                
-        s=time.time()
-        _hamming_nb(hashkeys, buckets)
-        e=time.time()
-        print("seqs traversal time taken: ", e-s)   
 
+                    if distance <= cutoff + 1:
+                        data_row[row_end_index] = distance
+                        indices_row[row_end_index] = candidate
+                        row_end_index += 1
 
-        exit()
+                row_element_counts[i] = row_end_index
+                data_rows.append(data_row[:row_end_index].copy())
+                indices_rows.append(indices_row[:row_end_index].copy())
 
-        for i, seq in enumerate(seqs):
-            candidates = sorted(self._get_candidates(seq, buckets, num_partitions))
-            data_row = np.empty(len(candidates))
-            indices_row = np.empty(len(candidates), dtype=np.int64)
-            row_end_index = 0
+            return data_rows, indices_rows, row_element_counts, np.zeros(0)
 
-            for candidate_idx in candidates:
-                hamming_distance = self._hamming(seq, seqs2[candidate_idx])
-                if hamming_distance <= self.cutoff:
-                    data_row[row_end_index] = hamming_distance + 1
-                    indices_row[row_end_index] = candidate_idx
-                    row_end_index += 1
+        s = time.time()
+        data_rows, indices_rows, row_element_counts, row_mins = _hamming_nb(hashkeys, buckets)
+        e = time.time()
+        print("seqs traversal time taken: ", e - s)
 
-            row_element_counts[i] = row_end_index
-            data_rows.append(data_row[:row_end_index].copy())
-            indices_rows.append(indices_row[:row_end_index].copy())
-
-        return data_rows, indices_rows, row_element_counts, np.array([None])
+        return data_rows, indices_rows, row_element_counts, row_mins
 
     _metric_mat = _hash_based_hamming_mat
 
