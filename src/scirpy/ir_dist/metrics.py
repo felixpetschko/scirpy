@@ -4,6 +4,10 @@ import warnings
 from collections.abc import Sequence
 from collections import defaultdict
 
+import time
+from numba.typed import List, Dict
+from numba import types
+
 import joblib
 import matplotlib.pyplot as plt
 import numba as nb
@@ -786,6 +790,10 @@ class HashbasedHammingDistanceCalculator(_MetricDistanceCalculator):
         self.cutoff = cutoff
 
     @staticmethod
+    def _hamming(a: str, b: str):
+        return sum(c1 != c2 for c1, c2 in zip(a, b))
+    
+    @staticmethod
     def _build_hash_keys(seq: str, num_partitions: int) -> list[str]:
         n = len(seq)
         return [seq[i::num_partitions] + str(n) for i in range(num_partitions)]
@@ -798,6 +806,20 @@ class HashbasedHammingDistanceCalculator(_MetricDistanceCalculator):
             for bucket_idx, hash_key in enumerate(hash_keys):
                 buckets[bucket_idx][hash_key].append(seq_idx)
         return buckets
+    
+    @staticmethod
+    def _create_numba_buckets(buckets: list[defaultdict[str, list[int]]]) -> List[Dict[str, np.ndarray]]:
+        numba_buckets = nb.typed.List()
+        for bucket_dict in buckets:
+            numba_bucket_dict = nb.typed.Dict.empty(
+                key_type=types.unicode_type,
+                value_type=types.int64[:]
+            )
+            for hashkey, bucket in bucket_dict.items():
+                bucket_array = np.asarray(bucket, dtype=np.int64)
+                numba_bucket_dict[hashkey] = bucket_array
+            numba_buckets.append(numba_bucket_dict)
+        return numba_buckets
 
     @staticmethod
     def _get_candidates(seq: str, buckets: list[defaultdict[str, list[int]]], num_partitions: int) -> set[int]:
@@ -807,10 +829,6 @@ class HashbasedHammingDistanceCalculator(_MetricDistanceCalculator):
             bucket_candidates = buckets[bucket_idx][hash_key]
             candidates.update(bucket_candidates)
         return candidates
-
-    @staticmethod
-    def _hamming(a: str, b: str):
-        return sum(c1 != c2 for c1, c2 in zip(a, b))
 
     def _hash_based_hamming_mat(
         self,
@@ -823,13 +841,80 @@ class HashbasedHammingDistanceCalculator(_MetricDistanceCalculator):
         if self.histogram:
             raise NotImplementedError("Creating a histogram is not implemented for the hash-based hamming metric")
 
-        num_partitions = self.cutoff + 1
+        cutoff = self.cutoff
+        num_partitions = cutoff + 1        
+               
 
+        unique_characters = "".join({char for string in (*seqs, *seqs2) for char in string})
+        max_seq_len = max(len(s) for s in (*seqs, *seqs2))
+
+        seqs_mat1, seqs_L1 = _seqs2mat(seqs, alphabet=unique_characters, max_len=max_seq_len)
+        seqs_mat2, seqs_L2 = _seqs2mat(seqs2, alphabet=unique_characters, max_len=max_seq_len)
+        
+        s=time.time()
         buckets = self._create_buckets(seqs2, num_partitions)
+        e=time.time()
+        print("create numba bucket time taken: ", e-s)
 
-        data_rows = []
-        indices_rows = []
-        row_element_counts = np.empty(len(seqs), dtype=np.int64)
+        s=time.time()
+        buckets = self._create_numba_buckets(buckets)
+        e=time.time()
+        print("create numba bucket time taken: ", e-s)
+
+        s=time.time()
+        hashkeys = List()  # outer list (type inferred)
+
+        for seq in seqs:
+            keys = self._build_hash_keys(seq, num_partitions)
+            sublist = List.empty_list(types.unicode_type)
+            for k in keys:
+                sublist.append(k)
+            hashkeys.append(sublist)
+        e=time.time()
+        print("hashkey time taken: ", e-s)
+
+        @nb.njit(cache=True)
+        def _hamming_nb(hashkeys_per_sequence, buckets):
+            for i in range(len(hashkeys_per_sequence)):
+                seq1 = seqs_mat1[i]
+                seq1_len = len(seq1)
+                hashkey_list = hashkeys_per_sequence[i]
+                candidates_raw = []
+                num_candidates = 0
+                for k in range(len(hashkey_list)):
+                    bucket = buckets[k]
+                    hashkey = hashkey_list[k]
+                    candidates = bucket[hashkey]
+                    candidates_raw.append(candidates)
+                    num_candidates += len(candidates)
+                candidates_arr = np.empty(num_candidates, dtype=np.int64)
+                candidates_arr_pointer = 0
+                for c in candidates_raw:
+                    num_elements = len(c)
+                    candidates_arr[candidates_arr_pointer:candidates_arr_pointer + num_elements] = c
+                    candidates_arr_pointer += num_elements
+
+                candidates_arr.sort()
+                
+                for idx in range(len(candidates_arr)):
+                    if idx > 0 and candidates_arr[idx] == candidates_arr[idx - 1]:
+                        continue
+                    candidate = candidates_arr[idx]
+                    seq2 = seqs_mat1[candidate]
+                    distance = 1
+                    for j in range(0, seq1_len):
+                        distance += seq1[j] != seq2[j]
+                    if(distance>100):
+                        print("test")
+                        
+                
+        s=time.time()
+        _hamming_nb(hashkeys, buckets)
+        e=time.time()
+        print("seqs traversal time taken: ", e-s)   
+
+
+        exit()
 
         for i, seq in enumerate(seqs):
             candidates = sorted(self._get_candidates(seq, buckets, num_partitions))
