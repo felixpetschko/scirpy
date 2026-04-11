@@ -759,15 +759,15 @@ class GPUHammingDistanceCalculator(_MetricDistanceCalculator):
     Reused under MIT license, Copyright (c) 2020 Andrew Fiore-Gartland.
 
     For performance reasons, the computation of the final result matrix is split up into several blocks. The parameter
-    gpu_n_blocks determines the number of those blocks. The parameter gpu_block_width determines how much GPU memory
+    gpu_col_blocks determines the number of those blocks. The parameter gpu_block_width determines how much GPU memory
     is reserved for the computed result of each block in SPARSE representation.
 
-    E.g. there is a 1000x1000 (dense represenation) not yet computed result matrix with gpu_n_blocks=10 and gpu_block_width=20.
+    E.g. there is a 1000x1000 (dense represenation) not yet computed result matrix with gpu_col_blocks=10 and gpu_block_width=20.
     Then the result matrix is computed in 10 blocks of  1000x100 (dense representation). Each of these blocks needs to fit into
     a 1000x20 block in SPARSE representation once computed and this 1000x20 block needs to fit into GPU memory. So there shouldn't
     be a resulting row in a block that has more than 20 values <= cutoff.
 
-    The parameter gpu_block_width should be chosen based on the available GPU memory. Choosing lower values for gpu_n_blocks increases
+    The parameter gpu_block_width should be chosen based on the available GPU memory. Choosing lower values for gpu_col_blocks increases
     the performance but also increases the risk of running out of reserved memory, since the result blocks that need to fit into the
     reserved GPU memory in sparse representation get bigger.
 
@@ -776,7 +776,7 @@ class GPUHammingDistanceCalculator(_MetricDistanceCalculator):
     cutoff:
         Will eleminate distances > cutoff to make efficient
         use of sparse matrices.
-    gpu_n_blocks:
+    gpu_col_blocks:
         Number of blocks in which the final result matrix should be computed. Each block reserves GPU memory
         in which the computed result block has to fit in sparse representation. Lower values give better performance
         but increase the risk of running out of reserved memory. This value should be chosen based on the
@@ -784,7 +784,7 @@ class GPUHammingDistanceCalculator(_MetricDistanceCalculator):
     gpu_block_width:
         Maximum width of blocks in which the final result matrix should be computed. Each block reserves GPU memory
         in which the computed result block has to fit in sparse representation. Higher values allow for a lower
-        number of result blocks (gpu_n_blocks) which increases the performance. This value should be chosen based on
+        number of result blocks (gpu_col_blocks) which increases the performance. This value should be chosen based on
         the GPU device memory.
     """
 
@@ -1385,15 +1385,15 @@ class GPUTCRdistDistanceCalculator(_MetricDistanceCalculator):
     Reused under MIT license, Copyright (c) 2020 Andrew Fiore-Gartland.
 
     For performance reasons, the computation of the final result matrix is split up into several blocks. The parameter
-    gpu_n_blocks determines the number of those blocks. The parameter gpu_block_width determines how much GPU memory
+    gpu_col_blocks determines the number of those blocks. The parameter gpu_block_width determines how much GPU memory
     is reserved for the computed result of each block in SPARSE representation.
 
-    E.g. there is a 1000x1000 (dense represenation) not yet computed result matrix with gpu_n_blocks=10 and gpu_block_width=20.
+    E.g. there is a 1000x1000 (dense represenation) not yet computed result matrix with gpu_col_blocks=10 and gpu_block_width=20.
     Then the result matrix is computed in 10 blocks of  1000x100 (dense representation). Each of these blocks needs to fit into
     a 1000x20 block in SPARSE representation once computed and this 1000x20 block needs to fit into GPU memory. So there shouldn't
     be a resulting row in a block that has more than 20 values <= cutoff.
 
-    The parameter gpu_block_width should be chosen based on the available GPU memory. Choosing lower values for gpu_n_blocks increases
+    The parameter gpu_block_width should be chosen based on the available GPU memory. Choosing lower values for gpu_col_blocks increases
     the performance but also increases the risk of running out of reserved memory, since the result blocks that need to fit into the
     reserved GPU memory in sparse representation get bigger.
 
@@ -1402,7 +1402,7 @@ class GPUTCRdistDistanceCalculator(_MetricDistanceCalculator):
     cutoff:
         Will eleminate distances > cutoff to make efficient
         use of sparse matrices.
-    gpu_n_blocks:
+    gpu_col_blocks:
         Number of blocks in which the final result matrix should be computed. Each block reserves GPU memory
         in which the computed result block has to fit in sparse representation. Lower values give better performance
         but increase the risk of running out of reserved memory. This value should be chosen based on the
@@ -1410,7 +1410,7 @@ class GPUTCRdistDistanceCalculator(_MetricDistanceCalculator):
     gpu_block_width:
         Maximum width of blocks in which the final result matrix should be computed. Each block reserves GPU memory
         in which the computed result block has to fit in sparse representation. Higher values allow for a lower
-        number of result blocks (gpu_n_blocks) which increases the performance. This value should be chosen based on
+        number of result blocks (gpu_col_blocks) which increases the performance. This value should be chosen based on
         the GPU device memory.
     """
 
@@ -1430,7 +1430,8 @@ class GPUTCRdistDistanceCalculator(_MetricDistanceCalculator):
         ntrim: int = 3,
         ctrim: int = 2,
         fixed_gappos: bool = True,
-        gpu_n_blocks: int = 10,
+        gpu_col_blocks: int = 10,
+        gpu_row_blocks: int = 1,
         gpu_block_width: int = 1000,
     ):
         super().__init__(n_jobs=1, n_blocks=1)
@@ -1445,7 +1446,8 @@ class GPUTCRdistDistanceCalculator(_MetricDistanceCalculator):
                 "amino acid distance matrix is stored as signed int8 values on the GPU."
             )
         self.cutoff = cutoff
-        self.gpu_n_blocks = gpu_n_blocks
+        self.gpu_col_blocks = gpu_col_blocks
+        self.gpu_row_blocks = gpu_row_blocks
         self.gpu_block_width = gpu_block_width
         self.dist_weight = dist_weight
         self.gap_penalty = gap_penalty
@@ -1504,16 +1506,11 @@ class GPUTCRdistDistanceCalculator(_MetricDistanceCalculator):
 
         dist_mat_weighted = self.tcr_nb_distance_matrix * dist_weight
 
-        seqs_lengths = np.vectorize(len)(seqs)
-        seqs_original_indices = np.argsort(seqs_lengths)
-        seqs = seqs[seqs_original_indices]
-
         seqs2_lengths = np.vectorize(len)(seqs2)
-        seqs2_original_indices = np.argsort(seqs2_lengths)
-        seqs2 = seqs2[seqs2_original_indices]
+        seqs2_original_indices_cpu = np.argsort(seqs2_lengths)
+        seqs2 = seqs2[seqs2_original_indices_cpu]
 
-        seqs_original_indices = cp.asarray(seqs_original_indices, dtype=np.int32)
-        seqs2_original_indices = cp.asarray(seqs2_original_indices, dtype=np.int32)
+        seqs2_original_indices = cp.asarray(seqs2_original_indices_cpu, dtype=np.int32)
 
         is_symmetric = False
 
@@ -1630,8 +1627,14 @@ class GPUTCRdistDistanceCalculator(_MetricDistanceCalculator):
             "create_csr_kernel",
         )
 
-        def calc_block_gpu(
-            seqs_mat1, seqs_mat2_block, seqs_L1_block, seqs_L2, seqs2_original_indices_blocks, block_offset
+        def calc_col_block_gpu(
+            seqs_mat1,
+            seqs_mat2_block,
+            seqs_L1_block,
+            seqs_L2,
+            seqs_original_indices_block,
+            seqs2_original_indices_blocks,
+            block_offset,
         ):
             import cupy as cp
 
@@ -1669,7 +1672,7 @@ class GPUTCRdistDistanceCalculator(_MetricDistanceCalculator):
                     d_seqs_mat2_transposed,
                     d_seqs_L1,
                     d_seqs_L2,
-                    seqs_original_indices,
+                    seqs_original_indices_block,
                     seqs2_original_indices_blocks,
                     cutoff,
                     d_data_matrix,
@@ -1746,40 +1749,18 @@ class GPUTCRdistDistanceCalculator(_MetricDistanceCalculator):
 
         # Set the number of blocks for the calculation. A higher number can be more memory friendly, whereas
         # a lower number can improve the performance.
-        n_blocks = self.gpu_n_blocks
+        n_col_blocks = self.gpu_col_blocks
+        n_row_blocks = self.gpu_row_blocks
 
-        seqs_mat2_blocks = np.array_split(seqs_mat2, n_blocks)
-        seqs_L2_blocks = np.array_split(seqs_L2, n_blocks)
-        seqs2_original_indices_blocks = np.array_split(seqs2_original_indices, n_blocks)
-        result_blocks = [None] * n_blocks
-
-        block_offset = start_column
+        seqs_mat1_blocks = np.array_split(seqs_mat1, n_row_blocks)
+        seqs_L1_blocks = np.array_split(seqs_L1, n_row_blocks)
+        seqs_mat2_blocks = np.array_split(seqs_mat2, n_col_blocks)
+        seqs_L2_blocks = np.array_split(seqs_L2, n_col_blocks)
+        seqs2_original_indices_blocks = np.array_split(seqs2_original_indices, n_col_blocks)
 
         logging.info(
-            f"\nStart GPU calculations for {n_blocks} sparse matrix result blocks of max width {self.gpu_block_width}:"
+            f"\nStart GPU calculations for {n_row_blocks} row blocks x {n_col_blocks} column blocks of max width {self.gpu_block_width}:"
         )
-
-        for i in tqdm(range(0, n_blocks), desc="Processing", unit="block"):
-            result_blocks[i] = calc_block_gpu(
-                seqs_mat1,
-                seqs_mat2_blocks[i],
-                seqs_L1,
-                seqs_L2_blocks[i],
-                seqs2_original_indices_blocks[i],
-                block_offset,
-            )
-            block_offset += seqs_mat2_blocks[i].shape[0]
-
-        num_elements = 0
-        for i in range(0, len(result_blocks)):
-            num_elements += result_blocks[i].indptr[-1]
-
-        assert (
-            num_elements <= np.iinfo(np.int32).max
-        ), f"""ERROR: The overall number of result values is too high to construct the final CSR matrix by combining
-        the already calculated blocks.
-        Current number: {num_elements}, Maximum number: {np.iinfo(np.int32).max}.
-        Consider choosing a smaller cutoff to resolve this issue."""
 
 
         @nb.njit
@@ -1817,21 +1798,62 @@ class GPUTCRdistDistanceCalculator(_MetricDistanceCalculator):
 
             shape = blocks[0].shape
             return csr_matrix((data, indices, indptr), shape=shape)
-            
+        
+         
+        def calc_row_block_gpu(seqs_mat1_block, seqs_L1_block):
+            row_sort_indices = np.argsort(seqs_L1_block)
+            seqs_mat1_block = seqs_mat1_block[row_sort_indices]
+            seqs_L1_block = seqs_L1_block[row_sort_indices]
+            seqs_original_indices_block = cp.asarray(np.argsort(row_sort_indices).astype(np.int32))
 
-        result_sparse = csr_union(result_blocks)
+            result_blocks = [None] * n_col_blocks
+            block_offset = start_column
+
+            for i in range(0, n_col_blocks):
+                result_blocks[i] = calc_col_block_gpu(
+                    seqs_mat1_block,
+                    seqs_mat2_blocks[i],
+                    seqs_L1_block,
+                    seqs_L2_blocks[i],
+                    seqs_original_indices_block,
+                    seqs2_original_indices_blocks[i],
+                    block_offset,
+                )
+                block_offset += seqs_mat2_blocks[i].shape[0]
+
+            num_elements = 0
+            for i in range(0, len(result_blocks)):
+                num_elements += result_blocks[i].indptr[-1]
+
+            assert (
+                num_elements <= np.iinfo(np.int32).max
+            ), f"""ERROR: The overall number of result values is too high to construct the final CSR matrix by combining
+            the already calculated blocks.
+            Current number: {num_elements}, Maximum number: {np.iinfo(np.int32).max}.
+            Consider choosing a smaller cutoff to resolve this issue."""
+                
+            result_sparse = csr_union(result_blocks)
+
+            result_sparse.sort_indices()
+
+            return result_sparse
+
+        row_blocks = [None] * n_row_blocks
+        with tqdm(total=n_row_blocks * n_col_blocks, desc="Processing", unit="block") as progress_bar:
+            for row_block_idx in range(n_row_blocks):
+                row_blocks[row_block_idx] = calc_row_block_gpu(
+                    seqs_mat1_blocks[row_block_idx],
+                    seqs_L1_blocks[row_block_idx],
+                )
+                progress_bar.update(n_col_blocks)
+
+        result_sparse = scipy.sparse.vstack(row_blocks, format="csr")
 
         row_element_counts_gpu = np.diff(result_sparse.indptr)
-        result_sparse.sort_indices()
 
-        # Returns the results in a way that fits the current interface, could be improved later
         return [result_sparse.data], [result_sparse.indices], row_element_counts_gpu, np.array([None])
 
     _metric_mat = _gpu_TCRdist_mat
-
-
-
-
 
 
 @_doc_params(params=_doc_params_parallel_distance_calculator)
