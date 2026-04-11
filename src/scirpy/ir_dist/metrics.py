@@ -1516,7 +1516,7 @@ class GPUTCRdistDistanceCalculator(_MetricDistanceCalculator):
             seqs_block_lengths = np.vectorize(len)(seqs_block)
             seqs_block_sort_indices = np.argsort(seqs_block_lengths)
             seqs_sorted_per_block.append(seqs_block[seqs_block_sort_indices])
-            seqs_original_indices_blocks.append(cp.asarray(np.argsort(seqs_block_sort_indices).astype(np.int32)))
+            seqs_original_indices_blocks.append(cp.asarray(seqs_block_sort_indices.astype(np.int32)))
 
         seqs = np.concatenate(seqs_sorted_per_block)
 
