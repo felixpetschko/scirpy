@@ -1505,6 +1505,20 @@ class GPUTCRdistDistanceCalculator(_MetricDistanceCalculator):
             raise NotImplementedError("Only fixed gap position implemented for GPU yet")
 
         dist_mat_weighted = self.tcr_nb_distance_matrix * dist_weight
+        n_col_blocks = self.gpu_col_blocks
+        n_row_blocks = self.gpu_row_blocks
+
+        seqs_blocks = np.array_split(np.asarray(seqs), n_row_blocks)
+        seqs_sorted_per_block = []
+        seqs_original_indices_blocks = []
+
+        for seqs_block in seqs_blocks:
+            seqs_block_lengths = np.vectorize(len)(seqs_block)
+            seqs_block_sort_indices = np.argsort(seqs_block_lengths)
+            seqs_sorted_per_block.append(seqs_block[seqs_block_sort_indices])
+            seqs_original_indices_blocks.append(cp.asarray(np.argsort(seqs_block_sort_indices).astype(np.int32)))
+
+        seqs = np.concatenate(seqs_sorted_per_block)
 
         seqs2_lengths = np.vectorize(len)(seqs2)
         seqs2_original_indices_cpu = np.argsort(seqs2_lengths)
@@ -1747,11 +1761,6 @@ class GPUTCRdistDistanceCalculator(_MetricDistanceCalculator):
             res = csr_matrix((data, indices, indptr), shape=(seqs_mat1.shape[0], seqs_mat2.shape[0]))
             return res
 
-        # Set the number of blocks for the calculation. A higher number can be more memory friendly, whereas
-        # a lower number can improve the performance.
-        n_col_blocks = self.gpu_col_blocks
-        n_row_blocks = self.gpu_row_blocks
-
         seqs_mat1_blocks = np.array_split(seqs_mat1, n_row_blocks)
         seqs_L1_blocks = np.array_split(seqs_L1, n_row_blocks)
         seqs_mat2_blocks = np.array_split(seqs_mat2, n_col_blocks)
@@ -1800,12 +1809,7 @@ class GPUTCRdistDistanceCalculator(_MetricDistanceCalculator):
             return csr_matrix((data, indices, indptr), shape=shape)
         
          
-        def calc_row_block_gpu(seqs_mat1_block, seqs_L1_block):
-            row_sort_indices = np.argsort(seqs_L1_block)
-            seqs_mat1_block = seqs_mat1_block[row_sort_indices]
-            seqs_L1_block = seqs_L1_block[row_sort_indices]
-            seqs_original_indices_block = cp.asarray(np.argsort(row_sort_indices).astype(np.int32))
-
+        def calc_row_block_gpu(seqs_mat1_block, seqs_L1_block, seqs_original_indices_block):
             result_blocks = [None] * n_col_blocks
             block_offset = start_column
 
@@ -1844,6 +1848,7 @@ class GPUTCRdistDistanceCalculator(_MetricDistanceCalculator):
                 row_blocks[row_block_idx] = calc_row_block_gpu(
                     seqs_mat1_blocks[row_block_idx],
                     seqs_L1_blocks[row_block_idx],
+                    seqs_original_indices_blocks[row_block_idx],
                 )
                 progress_bar.update(n_col_blocks)
 
