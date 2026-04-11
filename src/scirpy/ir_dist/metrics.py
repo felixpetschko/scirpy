@@ -394,7 +394,7 @@ def _seqs2mat(
     if max_len is None:
         max_len = np.max([len(s) for s in seqs])
     mat = -1 * np.ones((len(seqs), max_len), dtype=np.int8)
-    L = np.zeros(len(seqs), dtype=np.int8)
+    L = np.zeros(len(seqs), dtype=np.int8 if max_len <= np.iinfo(np.int8).max else np.int16)
     for si, s in enumerate(seqs):
         L[si] = min(len(s), max_len)
         for aai in range(max_len):
@@ -617,7 +617,7 @@ class HammingDistanceCalculator(_MetricDistanceCalculator):
         seqs2: Sequence[str],
         is_symmetric: bool = False,
         start_column: int = 0,
-    ) -> tuple[list[np.ndarray], list[np.ndarray], np.ndarray]:
+    ) -> tuple[list[np.ndarray], list[np.ndarray], np.ndarray, np.ndarray]:
         """Computes the pairwise hamming distances for sequences in seqs and seqs2.
 
         This function is a wrapper and contains an inner JIT compiled numba function without parameters. The reason for this is
@@ -858,7 +858,7 @@ class GPUHammingDistanceCalculator(_MetricDistanceCalculator):
             if max_len is None:
                 max_len = np.max([len(s) for s in seqs])
             mat = -1 * np.ones((len(seqs), max_len), dtype=np.int8)
-            L = np.zeros(len(seqs), dtype=np.int8)
+            L = np.zeros(len(seqs), dtype=np.int8 if max_len <= np.iinfo(np.int8).max else np.int16)
             for i, seq in enumerate(seqs):
                 mat[i][0 : len(seq)] = np.frombuffer(seq.encode("ascii"), dtype=np.uint8)
                 L[i] = len(seq)
@@ -1107,7 +1107,6 @@ class GPUHammingDistanceCalculator(_MetricDistanceCalculator):
         Current number: {num_elements}, Maximum number: {np.iinfo(np.int32).max}.
         Consider choosing a smaller cutoff to resolve this issue."""
 
-
         @nb.njit
         def csr_union_numba(block_data, block_indices, block_indptrs, num_rows, num_elements):
             data = np.empty(num_elements, dtype=block_data[0].dtype)
@@ -1130,7 +1129,6 @@ class GPUHammingDistanceCalculator(_MetricDistanceCalculator):
 
             return data, indices, indptr
 
-
         def csr_union(blocks):
             num_rows = blocks[0].shape[0]
             num_elements = sum(b.nnz for b in blocks)
@@ -1143,7 +1141,6 @@ class GPUHammingDistanceCalculator(_MetricDistanceCalculator):
 
             shape = blocks[0].shape
             return csr_matrix((data, indices, indptr), shape=shape)
-            
 
         result_sparse = csr_union(result_blocks)
 

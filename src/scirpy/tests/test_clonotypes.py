@@ -12,6 +12,8 @@ from mudata import MuData
 
 import scirpy as ir
 
+from . import TESTDATA
+
 
 @pytest.mark.parametrize("key_added", [None, "my_key"])
 @pytest.mark.parametrize("inplace", [True, False])
@@ -78,9 +80,9 @@ def test_clonotypes_end_to_end1(adata_define_clonotypes):
         dual_ir="all",
     )  # type: ignore
     print(clonotypes)
-    expected = ["0", "0", "1", "2", "nan"]
+    expected = ["0", "0", "1", "2", np.nan]
     expected_size = [2, 2, 1, 1, np.nan]
-    npt.assert_equal(clonotypes.values.astype(str), expected)
+    pdt.assert_extension_array_equal(clonotypes.array, pd.array(expected), check_dtype=False)
     npt.assert_equal(clonotype_size.values, expected_size)
 
 
@@ -241,16 +243,16 @@ def test_clonotype_clusters_end_to_end(
             "fr",
             False,
             [
-                [-0.478834, -1.463328],
-                [-0.478834, -1.4633283],
-                [-0.446773, -0.762333],
-                [1.948890, 0.358485],
-                [1.619500, -0.409771],
+                [0.8168581312048484, -0.5998359351272509],
+                [0.8168581312048484, -0.5998359351272509],
+                [0.5102479235509972, 0.03402664585673332],
+                [-2.1361996252554656, -0.00451326321092127],
+                [-1.5094203782869742, -0.5570739804378876],
                 [np.nan, np.nan],
-                [-1.162249, -1.506262],
-                [-1.018381, -0.359915],
-                [-1.470046, -0.876789],
-                [1.146254, 0.592541],
+                [1.4631495716508085, -0.37520604565881344],
+                [0.8743828283132641, 0.6267343727751706],
+                [1.4923560407323928, 0.32479780384697404],
+                [-1.5113744919098704, 0.5510704019559949],
                 [np.nan, np.nan],
             ],
         ],
@@ -390,8 +392,6 @@ def test_clonotype_convergence(adata_clonotype):
 
 
 def test_j_gene_matching():
-    from . import TESTDATA
-
     data = ad.read_h5ad(TESTDATA / "clonotypes_test_data/j_gene_test_data.h5ad")
 
     ir.tl.define_clonotype_clusters(
@@ -407,3 +407,22 @@ def test_j_gene_matching():
     clustering = data.obs["test_j_gene"].tolist()
     expected = ["0", "0", "0", "0", "0", "1", "1", "1", "1", "1", "1", "1", "1", "2", "2", "2", "2", "2"]
     assert np.array_equal(clustering, expected)
+
+
+def test_gene_segment_matching_index_error_issue_625():
+    """Regression test for #625, where an IndexError occured during gene segment matching."""
+    adata = ir.io.read_airr(TESTDATA / "airr" / "issue_625.tsv")
+    ir.pp.index_chains(adata)
+    ir.tl.chain_qc(adata)
+    ir.pp.ir_dist(adata, metric="normalized_hamming", cutoff=15, sequence="nt", histogram=False)
+    ir.tl.define_clonotype_clusters(
+        adata,
+        sequence="nt",
+        metric="normalized_hamming",
+        receptor_arms="all",
+        dual_ir="any",
+        same_v_gene=True,
+        same_j_gene=True,
+        partitions="fastgreedy",
+        key_added="clone_id_similarity",
+    )

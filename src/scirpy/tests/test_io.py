@@ -284,7 +284,8 @@ def test_convert_dandelion(anndata_from_10x_sample):
             del tmp_chain2["sequence_id"]
             del tmp_chain2["rearrangement_status"]
 
-            assert tmp_chain1 == tmp_chain2
+            # dandelion adds additional fields
+            assert tmp_chain1 == {k: tmp_chain2[k] for k in tmp_chain1}
 
 
 @pytest.mark.conda
@@ -303,6 +304,7 @@ def test_read_10x_csv():
                 "j_call",
                 "c_call",
                 "locus",
+                "sequence_id",
             ],
             ["VDJ_1", "VJ_1", "VDJ_2", "VJ_2"],
         )
@@ -313,6 +315,7 @@ def test_read_10x_csv():
     cell3 = obs.iloc[4, :]
 
     assert cell1.name == "AAACCTGAGTACGCCC-1"
+    assert cell1["VDJ_1_sequence_id"] == "AAACCTGAGTACGCCC-1_contig_1"
     assert cell1["VDJ_1_junction_aa"] == "CASSLGPSTDTQYF"
     assert cell1["VDJ_1_junction"] == "TGTGCCAGCAGCTTGGGACCTAGCACAGATACGCAGTATTTT"
     assert cell1["VDJ_1_umi_count"] == 55
@@ -326,6 +329,7 @@ def test_read_10x_csv():
     assert cell1["VDJ_1_locus"] == "TRB"
 
     assert cell2.name == "AAACCTGGTCCGTTAA-1"
+    assert cell2["VJ_1_sequence_id"] == "AAACCTGGTCCGTTAA-1_contig_4"
     assert cell2["VJ_1_junction_aa"] == "CALNTGGFKTIF"
     assert cell2["VJ_2_junction_aa"] == "CAVILDARLMF"
     assert cell2["VJ_1_umi_count"] == 5
@@ -507,8 +511,8 @@ def test_read_airr_issue280():
     """Test that reading the example shown in issue #280 works."""
     anndata = read_airr(TESTDATA / "airr" / "tra_issue_280.tsv")
     obs = ir.get.airr(anndata, "junction_aa", ["VDJ_1", "VJ_1"])
-    assert obs["VDJ_1_junction_aa"][0] == "CASSLGGESQNTLYF"
-    assert obs["VJ_1_junction_aa"][0] == "CAARGNRIFF"
+    assert obs["VDJ_1_junction_aa"].iloc[0] == "CASSLGGESQNTLYF"
+    assert obs["VJ_1_junction_aa"].iloc[0] == "CAARGNRIFF"
 
 
 @pytest.mark.conda
@@ -830,7 +834,7 @@ def test_airr_df():
         "orphan VDJ",
     ]
     obs = ir.get.airr(adata, "locus", ["VJ_1", "VDJ_1"])
-    assert obs["VJ_1_locus"].tolist() == ["IGL", None, None]
+    assert obs["VJ_1_locus"].tolist() == ["IGL", pd.NA, pd.NA]
     assert obs["VDJ_1_locus"].tolist() == ["IGH"] * 3
 
 

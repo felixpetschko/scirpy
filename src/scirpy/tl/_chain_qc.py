@@ -3,6 +3,7 @@ from typing import cast
 
 import awkward as ak
 import numpy as np
+import pandas as pd
 from scanpy import logging
 
 from scirpy import get
@@ -18,7 +19,7 @@ def chain_qc(
     chain_idx_key="chain_indices",
     inplace: bool = True,
     key_added: Sequence[str] = ("receptor_type", "receptor_subtype", "chain_pairing"),
-) -> None | tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> None | tuple[pd.Series, pd.Series, pd.Series]:
     """\
     Perform quality control based on the receptor-chain pairing configuration.
 
@@ -86,18 +87,18 @@ def chain_qc(
     mask_has_ir = get._has_ir(params)
     mask_multichain = mask_has_ir & ak.to_numpy(params.chain_indices["multichain"])
 
-    vj_loci = cast(np.ndarray, get.airr(params, "locus", ["VJ_1", "VJ_2"]).values)
-    vdj_loci = cast(np.ndarray, get.airr(params, "locus", ["VDJ_1", "VDJ_2"]).values)
+    vj_loci = cast(pd.DataFrame, get.airr(params, "locus", ["VJ_1", "VJ_2"]))
+    vdj_loci = cast(pd.DataFrame, get.airr(params, "locus", ["VDJ_1", "VDJ_2"]))
 
     # Build masks for receptor chains
-    has_tra = (vj_loci == "TRA").any(axis=1)
-    has_trg = (vj_loci == "TRG").any(axis=1)
-    has_igk = (vj_loci == "IGK").any(axis=1)
-    has_igl = (vj_loci == "IGL").any(axis=1)
+    has_tra = np.asarray((vj_loci == "TRA").any(axis=1))
+    has_trg = np.asarray((vj_loci == "TRG").any(axis=1))
+    has_igk = np.asarray((vj_loci == "IGK").any(axis=1))
+    has_igl = np.asarray((vj_loci == "IGL").any(axis=1))
 
-    has_trb = (vdj_loci == "TRB").any(axis=1)
-    has_trd = (vdj_loci == "TRD").any(axis=1)
-    has_igh = (vdj_loci == "IGH").any(axis=1)
+    has_trb = np.asarray((vdj_loci == "TRB").any(axis=1))
+    has_trd = np.asarray((vdj_loci == "TRD").any(axis=1))
+    has_igh = np.asarray((vdj_loci == "IGH").any(axis=1))
 
     has_tr = has_tra | has_trg | has_trb | has_trd
     has_ig = has_igk | has_igl | has_igh
@@ -134,13 +135,26 @@ def chain_qc(
 
     res_chain_pairing = _chain_pairing(params, res_receptor_subtype == "ambiguous", mask_has_ir, mask_multichain)
 
+    # in mdata, cells that do not have a member in the AIRR modality should have the label "no IR"
+    # we achieve this by initalizing the full array with "no IR" and then overwriting all entries with
+    # the values calculated for the AIRR modality
+    res_receptor_subtype_mdata = pd.Series(
+        np.full(fill_value="no IR", shape=(params.data.shape[0],), dtype=f"<U{string_length}"),
+        index=params.data.obs_names,
+    )
+    res_receptor_type_mdata = res_receptor_subtype_mdata.copy()
+    res_chain_pairing_mdata = res_receptor_subtype_mdata.copy()
+    res_receptor_subtype_mdata[params.adata.obs_names] = res_receptor_subtype
+    res_receptor_type_mdata[params.adata.obs_names] = res_receptor_type
+    res_chain_pairing_mdata[params.adata.obs_names] = res_chain_pairing
+
     if inplace:
         col_receptor_type, col_receptor_subtype, col_chain_pairing = key_added
-        params.set_obs(col_receptor_type, res_receptor_type)
-        params.set_obs(col_receptor_subtype, res_receptor_subtype)
-        params.set_obs(col_chain_pairing, res_chain_pairing)
+        params.set_obs(col_receptor_type, res_receptor_type_mdata)
+        params.set_obs(col_receptor_subtype, res_receptor_subtype_mdata)
+        params.set_obs(col_chain_pairing, res_chain_pairing_mdata)
     else:
-        return (res_receptor_type, res_receptor_subtype, res_chain_pairing)
+        return (res_receptor_type_mdata, res_receptor_subtype_mdata, res_chain_pairing_mdata)
 
 
 def _chain_pairing(

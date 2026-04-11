@@ -2,6 +2,8 @@ import json
 
 import numpy as np
 import numpy.testing as npt
+import pandas as pd
+import pandas.testing as pdt
 import pytest
 from mudata import MuData
 
@@ -45,8 +47,8 @@ def test_ir_query(adata_cdr3, adata_cdr3_2, metric, key1, key2):
 @pytest.mark.parametrize(
     "input,expected",
     [
-        ([], np.nan),
-        ([np.nan], np.nan),
+        ([], None),
+        ([np.nan], None),
         (["a", "b", np.nan], "ambiguous"),
         (["a", "a"], "a"),
         (["a", "a", np.nan], "a"),
@@ -60,8 +62,8 @@ def test_reduce_unique_only(input, expected):
 @pytest.mark.parametrize(
     "input,expected",
     [
-        ([], np.nan),
-        ([np.nan], np.nan),
+        ([], None),
+        ([np.nan], None),
         (["a", "b", np.nan], "ambiguous"),
         (["a", "a"], "a"),
         (["a", "a", "b"], "a"),
@@ -188,7 +190,7 @@ def test_ir_query_annotate_df(query_reference, same_v_gene, match_columns, expec
                 ("cell2", "ambiguous"),
                 ("cell3", "CELL3"),
                 ("cell4", "CELL4"),
-                ("cell10", np.nan),
+                ("cell10", None),
             ],
         ),
         (
@@ -197,7 +199,7 @@ def test_ir_query_annotate_df(query_reference, same_v_gene, match_columns, expec
                 ("cell2", "ambiguous"),
                 ("cell3", "CELL3"),
                 ("cell4", "CELL4"),
-                ("cell10", np.nan),
+                ("cell10", None),
             ],
         ),
         (
@@ -209,7 +211,7 @@ def test_ir_query_annotate_df(query_reference, same_v_gene, match_columns, expec
                 ),
                 ("cell3", json.dumps({"CELL3": 1})),
                 ("cell4", json.dumps({"CELL4": 1})),
-                ("cell10", np.nan),
+                ("cell10", None),
             ],
         ),
     ],
@@ -241,4 +243,4 @@ def test_ir_query_annotate(query_reference, strategy, expected):
     actual = list(query.obs[key].items())
     print(actual)
 
-    assert actual == expected
+    pdt.assert_series_equal(query.obs[key], pd.Series(dict(expected)), check_names=False)
