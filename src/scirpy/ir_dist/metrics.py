@@ -1439,6 +1439,11 @@ class GPUTCRdistDistanceCalculator(_MetricDistanceCalculator):
                 "GPUTCRdistDistanceCalculator only supports cutoff <= 126 because the intermediate "
                 "GPU buffer stores distances as signed int8 values and uses distance + 1 encoding."
             )
+        if dist_weight > 10:
+            raise ValueError(
+                "GPUTCRdistDistanceCalculator only supports dist_weight <= 10 because the weighted "
+                "amino acid distance matrix is stored as signed int8 values on the GPU."
+            )
         self.cutoff = cutoff
         self.gpu_n_blocks = gpu_n_blocks
         self.gpu_block_width = gpu_block_width
@@ -1527,7 +1532,7 @@ class GPUTCRdistDistanceCalculator(_MetricDistanceCalculator):
             const int* __restrict__ seqs_original_indices,
             const int* seqs2_original_indices,
             const int cutoff,
-            int* __restrict__ data,
+            char* __restrict__ data,
             int* __restrict__ indices,
             int* __restrict__ row_element_counts,
             const int block_offset,
@@ -1603,7 +1608,7 @@ class GPUTCRdistDistanceCalculator(_MetricDistanceCalculator):
         extern "C" __global__
         void create_csr_kernel(
             int* data, int* indices,
-            int* data_matrix, int* indices_matrix,
+            char* data_matrix, int* indices_matrix,
             int* indptr, int data_matrix_rows, int data_matrix_cols, int data_rows, int indices_matrix_cols
         ) {
             int row = blockDim.x * blockIdx.x + threadIdx.x;
@@ -1641,7 +1646,7 @@ class GPUTCRdistDistanceCalculator(_MetricDistanceCalculator):
             # set a maximum result width for the current block
             max_block_width = self.gpu_block_width
 
-            d_data_matrix = cp.empty((seqs_mat1.shape[0], max_block_width), dtype=cp.int32)
+            d_data_matrix = cp.empty((seqs_mat1.shape[0], max_block_width), dtype=cp.int8)
             d_indices_matrix = cp.empty((seqs_mat1.shape[0], max_block_width), dtype=np.int32)
             d_row_element_counts = cp.zeros(seqs_mat1.shape[0], dtype=np.int32)
 

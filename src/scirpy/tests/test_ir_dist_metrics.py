@@ -755,6 +755,13 @@ def test_gpu_tcrdist_cutoff_guard():
         GPUTCRdistDistanceCalculator(cutoff=127)
 
 
+@pytest.mark.gpu
+def test_gpu_tcrdist_dist_weight_guard():
+    GPUTCRdistDistanceCalculator(dist_weight=10)
+    with pytest.raises(ValueError, match="dist_weight <= 10"):
+        GPUTCRdistDistanceCalculator(dist_weight=11)
+
+
 def test_hamming_histogram_reference():
     from . import TESTDATA
 
