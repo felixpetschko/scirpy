@@ -10,6 +10,7 @@ from scirpy.ir_dist.metrics import (
     AlignmentDistanceCalculator,
     DistanceCalculator,
     FastAlignmentDistanceCalculator,
+    GPUTCRdistDistanceCalculator,
     GPUHammingDistanceCalculator,
     HammingDistanceCalculator,
     IdentityDistanceCalculator,
@@ -740,6 +741,18 @@ def test_gpu_hamming_long_sequence():
     seq2 = np.array(["A" * 128, "ABBB", "ABBB"])
     res = hamming_calculator.calc_dist_mat(seq1, seq2)
     assert isinstance(res, scipy.sparse.csr_matrix)
+
+
+@pytest.mark.gpu
+def test_gpu_hamming_cutoff_guard():
+    with pytest.raises(ValueError, match="cutoff <= 126"):
+        GPUHammingDistanceCalculator(cutoff=127)
+
+
+@pytest.mark.gpu
+def test_gpu_tcrdist_cutoff_guard():
+    with pytest.raises(ValueError, match="cutoff <= 126"):
+        GPUTCRdistDistanceCalculator(cutoff=127)
 
 
 def test_hamming_histogram_reference():
