@@ -1599,8 +1599,8 @@ class GPUTCRdistDistanceCalculator(_MetricDistanceCalculator):
                         }
                         if (distance <= cutoff + 1) {
                             int seqs2_original_index = seqs2_original_indices[col];
-                            data[seqs_original_index * data_cols + row_end_index] = distance;
-                            indices[seqs_original_index * indices_cols + row_end_index] = seqs2_original_index;
+                            data[(long long)seqs_original_index * data_cols + row_end_index] = distance;
+                            indices[(long long)seqs_original_index * indices_cols + row_end_index] = seqs2_original_index;
                             row_end_index++;
                         }
                         
@@ -1632,8 +1632,8 @@ class GPUTCRdistDistanceCalculator(_MetricDistanceCalculator):
                 int data_index = row_start + col;
 
                 if ((data_index < data_rows) && (col < row_end_index)) {
-                    data[data_index] = data_matrix[row * data_matrix_cols + col];
-                    indices[data_index] = indices_matrix[row * indices_matrix_cols + col];
+                    data[data_index] = data_matrix[(long long)row * data_matrix_cols + col];
+                    indices[data_index] = indices_matrix[(long long)row * indices_matrix_cols + col];
                 }
             }
         }
