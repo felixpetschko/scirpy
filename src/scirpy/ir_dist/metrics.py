@@ -1520,11 +1520,21 @@ class GPUTCRdistDistanceCalculator(_MetricDistanceCalculator):
 
         seqs = np.concatenate(seqs_sorted_per_block)
 
-        seqs2_lengths = np.vectorize(len)(seqs2)
-        seqs2_original_indices_cpu = np.argsort(seqs2_lengths)
-        seqs2 = seqs2[seqs2_original_indices_cpu]
+        seqs2_blocks = np.array_split(np.asarray(seqs2), n_col_blocks)
+        seqs2_sorted_per_block = []
+        seqs2_original_indices_blocks = []
+        seqs2_block_start = 0
 
-        seqs2_original_indices = cp.asarray(seqs2_original_indices_cpu, dtype=np.int32)
+        for seqs2_block in seqs2_blocks:
+            seqs2_block_lengths = np.vectorize(len)(seqs2_block)
+            seqs2_block_sort_indices = np.argsort(seqs2_block_lengths)
+            seqs2_sorted_per_block.append(seqs2_block[seqs2_block_sort_indices])
+            seqs2_original_indices_blocks.append(
+                cp.asarray((seqs2_block_sort_indices + seqs2_block_start).astype(np.int32))
+            )
+            seqs2_block_start += len(seqs2_block)
+
+        seqs2 = np.concatenate(seqs2_sorted_per_block)
 
         is_symmetric = False
 
@@ -1765,7 +1775,6 @@ class GPUTCRdistDistanceCalculator(_MetricDistanceCalculator):
         seqs_L1_blocks = np.array_split(seqs_L1, n_row_blocks)
         seqs_mat2_blocks = np.array_split(seqs_mat2, n_col_blocks)
         seqs_L2_blocks = np.array_split(seqs_L2, n_col_blocks)
-        seqs2_original_indices_blocks = np.array_split(seqs2_original_indices, n_col_blocks)
 
         logging.info(
             f"\nStart GPU calculations for {n_row_blocks} row blocks x {n_col_blocks} column blocks of max width {self.gpu_block_width}:"
