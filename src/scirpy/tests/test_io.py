@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+import awkward as ak
 import numpy as np
 import pandas as pd
 import pandas.testing as pdt
@@ -513,6 +514,41 @@ def test_read_airr_issue280():
     obs = ir.get.airr(anndata, "junction_aa", ["VDJ_1", "VJ_1"])
     assert obs["VDJ_1_junction_aa"].iloc[0] == "CASSLGGESQNTLYF"
     assert obs["VJ_1_junction_aa"].iloc[0] == "CAARGNRIFF"
+
+
+def test_read_airr_dataframe_fast_path():
+    df = pd.DataFrame(
+        {
+            "cell_id": ["cell1", "cell1", "cell2"],
+            "locus": ["TRA", "TRB", "IGH"],
+            "productive": [True, True, False],
+            "junction_aa": ["CAVR", "CASS", "CAR"],
+            "umi_count": [1, 2, None],
+            "is_cell": [True, True, False],
+        }
+    )
+
+    anndata = read_airr(df, cell_attributes=("is_cell",), key_added="airr_fast")
+
+    assert anndata.obs.index.tolist() == ["cell1", "cell2"]
+    assert anndata.obs["is_cell"].tolist() == [True, False]
+    chains = ak.to_list(anndata.obsm["airr_fast"])
+    assert [[chain["locus"] for chain in cell] for cell in chains] == [["TRA", "TRB"], ["IGH"]]
+    assert [[chain["junction_aa"] for chain in cell] for cell in chains] == [["CAVR", "CASS"], ["CAR"]]
+    assert [[chain["umi_count"] for chain in cell] for cell in chains] == [[1, 2], [None]]
+
+
+def test_read_airr_dataframe_fast_path_cell_attribute_conflict():
+    df = pd.DataFrame(
+        {
+            "cell_id": ["cell1", "cell1"],
+            "locus": ["TRA", "TRB"],
+            "is_cell": [True, False],
+        }
+    )
+
+    with pytest.raises(ValueError, match="Cell-level attributes differ"):
+        read_airr(df, cell_attributes=("is_cell",))
 
 
 @pytest.mark.conda

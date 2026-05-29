@@ -5,9 +5,11 @@ import re
 import sys
 from collections.abc import Collection, Iterable, Sequence
 from glob import iglob
+from importlib.metadata import version
 from pathlib import Path
 from typing import Any
 
+import awkward as ak
 import numpy as np
 import pandas as pd
 from anndata import AnnData
@@ -24,6 +26,247 @@ from ._util import _IOLogger, _read_airr_rearrangement_df, doc_airr_fields, doc_
 sys.modules["tracerlib"] = _tracerlib
 
 DEFAULT_AIRR_CELL_ATTRIBUTES = "is_cell"
+
+
+def _normalize_cell_attributes(cell_attributes: Collection[str]) -> tuple[str, ...]:
+    if isinstance(cell_attributes, str):
+        return (cell_attributes,)
+    return tuple(cell_attributes)
+
+
+def _airr_bool(value):
+    if value is None or pd.isna(value):
+        return None
+    if isinstance(value, bool):
+        return value
+    if value in (0, 1):
+        return bool(value)
+    value = str(value).lower()
+    if value in ("t", "true"):
+        return True
+    if value in ("f", "false"):
+        return False
+    return value
+
+
+def _convert_airr_dataframe_types(
+    df: pd.DataFrame, *, normalize_missing_strings: bool = True, profile_read_airr: bool = False
+) -> pd.DataFrame:
+    import time
+
+    total_start = time.time()
+    schema_start = time.time()
+    schema = get_rearrangement_schema()
+    schema_end = time.time()
+
+    replace_start = time.time()
+    replaced_missing_columns = 0
+    if normalize_missing_strings:
+        missing_strings = ["", "NaN", "nan", "None", "N/A"]
+        string_columns = df.select_dtypes(include=["object", "string"]).columns
+        for column in string_columns:
+            missing_mask = df[column].isin(missing_strings)
+            if missing_mask.any():
+                replaced_missing_columns += 1
+                df.loc[missing_mask, column] = None
+    replace_end = time.time()
+
+    typed_columns = 0
+    unknown_columns = 0
+    boolean_columns = 0
+    numeric_columns = 0
+    failed_numeric_columns = 0
+    column_timings = []
+    for column in df.columns:
+        column_start = time.time()
+        try:
+            field_type = schema.type(column)
+        except KeyError:
+            unknown_columns += 1
+            continue
+
+        typed_columns += 1
+        if field_type == "boolean":
+            boolean_columns += 1
+            mapped = df[column].map(
+                {
+                    "T": True,
+                    "F": False,
+                    "true": True,
+                    "false": False,
+                    "True": True,
+                    "False": False,
+                    True: True,
+                    False: False,
+                    1: True,
+                    0: False,
+                }
+            )
+            df[column] = mapped.where(mapped.notna(), df[column])
+        elif field_type in {"integer", "number"}:
+            numeric_columns += 1
+            try:
+                df[column] = pd.to_numeric(df[column], errors="raise")
+            except (TypeError, ValueError):
+                failed_numeric_columns += 1
+                pass
+        column_end = time.time()
+        if profile_read_airr:
+            column_timings.append((column, field_type, column_end - column_start))
+
+    if profile_read_airr:
+        total_end = time.time()
+        print("AIRR dataframe type conversion profile:")
+        print(f"  total: {total_end - total_start:.3f} s")
+        print(f"  load schema: {schema_end - schema_start:.3f} s")
+        print(f"  replace missing-value strings: {replace_end - replace_start:.3f} s")
+        print(f"  columns with missing-value strings replaced: {replaced_missing_columns}")
+        print(f"  AIRR schema columns: {typed_columns}")
+        print(f"  unknown columns skipped: {unknown_columns}")
+        print(f"  boolean columns converted: {boolean_columns}")
+        print(f"  numeric columns converted: {numeric_columns}")
+        print(f"  numeric columns left unchanged after failure: {failed_numeric_columns}")
+        print("  slowest converted columns:")
+        for column, field_type, elapsed in sorted(column_timings, key=lambda x: x[2], reverse=True)[:15]:
+            print(f"    {column} ({field_type}): {elapsed:.3f} s")
+
+    return df
+
+
+def _series_to_awkward_array(series: pd.Series) -> ak.Array:
+    if series.hasnans:
+        series = series.astype(object).where(pd.notna(series), None)
+        return ak.Array(series.tolist())
+    if pd.api.types.is_object_dtype(series.dtype) or pd.api.types.is_string_dtype(series.dtype):
+        return ak.Array(series.tolist())
+    return ak.Array(series.to_numpy())
+
+
+def _airr_dataframe_to_columnar_chains(df: pd.DataFrame, chain_columns: Sequence[str]) -> ak.Array:
+    chain_arrays = {column: _series_to_awkward_array(df[column]) for column in chain_columns}
+    chain_records = ak.zip(chain_arrays, depth_limit=1)
+    return ak.unflatten(chain_records, np.ones(len(df), dtype=np.int64))
+
+
+def _read_airr_rearrangement_df_fast(
+    path: pd.DataFrame | Sequence[pd.DataFrame],
+    *,
+    infer_locus: bool = True,
+    cell_attributes: Collection[str] = DEFAULT_AIRR_CELL_ATTRIBUTES,
+    airr_fields: Collection[str] | None = None,
+    key_added: str = "airr",
+    normalize_missing_strings: bool = True,
+    profile_read_airr: bool = False,
+) -> AnnData:
+    import time
+
+    start = time.time()
+    if isinstance(path, pd.DataFrame):
+        df = path
+    else:
+        df = pd.concat(path, ignore_index=True)
+
+    if "cell_id" not in df.columns:
+        raise ValueError("AIRR data frame must contain a `cell_id` column.")
+
+    # Work on a shallow copy so we can add missing AIRR-required fields without modifying user data.
+    df = df.copy(deep=False)
+    cell_attribute_fields = _normalize_cell_attributes(cell_attributes)
+
+    select_start = time.time()
+    if airr_fields is not None:
+        airr_fields = tuple(dict.fromkeys(airr_fields))
+        for field in airr_fields:
+            if field not in df.columns:
+                df[field] = None
+        selected_columns = ["cell_id"]
+        selected_columns.extend(field for field in cell_attribute_fields if field in df.columns)
+        selected_columns.extend(field for field in airr_fields if field != "cell_id")
+        df = df.loc[:, list(dict.fromkeys(selected_columns))]
+    select_end = time.time()
+
+    required_start = time.time()
+    if airr_fields is None:
+        for field in get_rearrangement_schema().required:
+            if field not in df.columns:
+                df[field] = None
+    required_end = time.time()
+
+    if infer_locus and "locus" not in df.columns:
+        infer_start = time.time()
+        df["locus"] = df.apply(_infer_locus_from_gene_names, axis=1)
+        infer_end = time.time()
+    else:
+        infer_start = infer_end = time.time()
+
+    convert_start = time.time()
+    df = _convert_airr_dataframe_types(
+        df, normalize_missing_strings=normalize_missing_strings, profile_read_airr=profile_read_airr
+    )
+    convert_end = time.time()
+
+    sanitize_start = sanitize_end = time.time()
+
+    cell_id = df["cell_id"].astype(str)
+    cell_attribute_fields = tuple(field for field in cell_attribute_fields if field in df.columns)
+
+    obs_start = time.time()
+    obs_columns = ["cell_id", *cell_attribute_fields]
+    if cell_attribute_fields:
+        duplicated_attrs = df.groupby("cell_id", sort=False)[list(cell_attribute_fields)].nunique(dropna=False)
+        conflicting_attrs = duplicated_attrs.gt(1).any(axis=1)
+        if conflicting_attrs.any():
+            raise ValueError("Cell-level attributes differ between different chains.")
+    obs = df.loc[:, obs_columns].drop_duplicates("cell_id").set_index("cell_id")
+    obs.index = obs.index.astype(str)
+    obs_end = time.time()
+
+    chains_start = time.time()
+    chain_columns = [column for column in df.columns if column not in {"cell_id", *cell_attribute_fields}]
+
+    if cell_id.is_unique:
+        chains = _airr_dataframe_to_columnar_chains(df, chain_columns)
+    else:
+        chain_df = df.loc[:, chain_columns].astype(object).where(pd.notna(df.loc[:, chain_columns]), None)
+        chain_records = chain_df.to_dict(orient="records")
+        chains_by_cell = {}
+        ordered_cell_ids = []
+        for tmp_cell_id, chain_record in zip(cell_id, chain_records, strict=False):
+            try:
+                tmp_chains = chains_by_cell[tmp_cell_id]
+            except KeyError:
+                tmp_chains = []
+                chains_by_cell[tmp_cell_id] = tmp_chains
+                ordered_cell_ids.append(tmp_cell_id)
+            tmp_chains.append(chain_record)
+        chains = [chains_by_cell[tmp_cell_id] for tmp_cell_id in ordered_cell_ids]
+        chains = ak.Array(chains)
+    chains_end = time.time()
+
+    anndata_start = time.time()
+    adata = AnnData(
+        X=None,
+        obs=obs,
+        obsm={key_added: chains},
+        uns={"scirpy_version": version("scirpy")},
+    )
+    anndata_end = time.time()
+
+    if profile_read_airr:
+        print("fast dataframe read_airr timing profile:")
+        print(f"  total: {anndata_end - start:.3f} s")
+        print(f"  select AIRR fields: {select_end - select_start:.3f} s")
+        print(f"  add missing required fields: {required_end - required_start:.3f} s")
+        print(f"  infer locus: {infer_end - infer_start:.3f} s")
+        print(f"  convert AIRR field types: {convert_end - convert_start:.3f} s")
+        print(f"  sanitize missing values: {sanitize_end - sanitize_start:.3f} s")
+        print(f"  build obs: {obs_end - obs_start:.3f} s")
+        print(f"  build chains: {chains_end - chains_start:.3f} s")
+        print(f"  build anndata: {anndata_end - anndata_start:.3f} s")
+        print(f"  rearrangements processed: {len(df)}")
+        print(f"  cells created: {adata.n_obs}")
+
+    return adata
 
 
 def _cdr3_from_junction(junction_aa, junction_nt):
@@ -361,6 +604,9 @@ def read_airr(
     infer_locus: bool = True,
     cell_attributes: Collection[str] = DEFAULT_AIRR_CELL_ATTRIBUTES,
     include_fields: Any = None,
+    airr_fields: Collection[str] | None = None,
+    normalize_missing_strings: bool = True,
+    profile_read_airr: bool = False,
     **kwargs,
 ) -> AnnData:
     """\
@@ -389,6 +635,14 @@ def read_airr(
         cell. This defaults to {cell_attributes}.
     include_fields
         Deprecated. Does not have any effect as of v0.13.
+    airr_fields
+        AIRR fields to keep when reading from a pandas data frame. By default,
+        all fields are preserved.
+    normalize_missing_strings
+        Replace AIRR-style missing string values such as `""`, `"nan"`, and `"N/A"`
+        with `None` when reading from a pandas data frame.
+    profile_read_airr
+        Print timing measurements for the fast pandas data frame path.
     **kwargs
         are passed to :func:`~scirpy.io.from_airr_cells`.
 
@@ -405,6 +659,20 @@ def read_airr(
 
     if isinstance(path, str | Path | pd.DataFrame):
         path: list[str | Path | pd.DataFrame] = [path]  # type: ignore
+
+    if all(isinstance(tmp_path_or_df, pd.DataFrame) for tmp_path_or_df in path):
+        key_added = kwargs.pop("key_added", "airr")
+        if kwargs:
+            raise TypeError(f"Unexpected keyword arguments: {', '.join(kwargs)}")
+        return _read_airr_rearrangement_df_fast(
+            path,  # type: ignore[arg-type]
+            infer_locus=infer_locus,
+            cell_attributes=cell_attributes,
+            airr_fields=airr_fields,
+            key_added=key_added,
+            normalize_missing_strings=normalize_missing_strings,
+            profile_read_airr=profile_read_airr,
+        )
 
     for tmp_path_or_df in path:
         if isinstance(tmp_path_or_df, pd.DataFrame):
@@ -427,7 +695,8 @@ def read_airr(
 
             if infer_locus and "locus" not in chain_dict:
                 logger.warning(
-                    "`locus` column not found in input data. The locus is being inferred from the {v,d,j,c}_call columns."
+                    "`locus` column not found in input data. The locus is being inferred from the "
+                    "{v,d,j,c}_call columns."
                 )
                 chain_dict["locus"] = _infer_locus_from_gene_names(chain_dict)
 
