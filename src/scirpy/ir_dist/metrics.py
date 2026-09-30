@@ -1777,6 +1777,552 @@ class NeedlemanWunschDistanceCalculator(_MetricDistanceCalculator):
     _metric_mat = _needleman_wunsch_mat
 
 
+class GPUNeedlemanWunschDistanceCalculator(NeedlemanWunschDistanceCalculator):
+    """Computes linear-gap Needleman-Wunsch distances with GPU support.
+
+    For each sequence pair, a global alignment score is computed using the
+    Needleman-Wunsch dynamic programming algorithm with one linear gap penalty
+    for every gap position. The alignment score is converted into a distance by
+    subtracting it from the best possible self-alignment score of the two
+    sequences:
+    ``min(self_score(seq1), self_score(seq2)) - alignment_score(seq1, seq2)``.
+    Distances are therefore small for sequence pairs that can be globally
+    aligned with few or conservative substitutions and short gaps, and larger
+    for sequence pairs requiring strongly penalized substitutions or many gap
+    positions.
+
+    Non-canonical amino acids receive a substitution score of zero and trigger a warning.
+
+    For performance reasons, the rows and columns of the final result matrix are grouped into tiles for GPU
+    computation. `gpu_tile_rows` and `gpu_tile_cols` control how many matrix rows and columns are grouped into each
+    tile. Each tile is computed on the GPU and converted to a sparse CSR matrix before the tiles are combined again.
+
+    `gpu_tile_buffer_cols` controls how many buffer columns are initially reserved for sparse result entries in each
+    row of a tile. Because only distances at or below the cutoff are retained, the number of entries that need to be
+    stored is usually considerably smaller than the number of columns in the tile. If necessary, the buffer is
+    enlarged and the calculation is retried.
+
+    Smaller tiles reduce per-tile memory pressure but add tile-management overhead. Larger values for
+    `gpu_tile_buffer_cols` can avoid retries but require more GPU memory.
+
+    Parameters
+    ----------
+    cutoff:
+        Eliminate distances above this value. Defaults to 10.
+    gap_penalty:
+        Linear penalty for each gap position. Defaults to 4.
+    n_blocks:
+        Number of outer row partitions submitted through joblib. A distributed joblib backend
+        can distribute these partitions across multiple GPU workers.
+    gpu_tile_rows:
+        Number of result matrix rows per GPU tile.
+    gpu_tile_cols:
+        Number of result matrix columns per GPU tile.
+    gpu_tile_buffer_cols:
+        Initial number of retained sparse entries reserved per tile row. If necessary, the
+        buffer grows and the tile is recomputed. Larger buffers require more GPU memory.
+    """
+
+    def __init__(
+        self,
+        cutoff: int = 10,
+        *,
+        gap_penalty: int = 4,
+        n_blocks: int = 1,
+        gpu_tile_rows: int = 100_000,
+        gpu_tile_cols: int = 100_000,
+        gpu_tile_buffer_cols: int = 1000,
+    ):
+        super().__init__(cutoff=cutoff, gap_penalty=gap_penalty, n_jobs=1, n_blocks=n_blocks)
+        for name, value in (("cutoff", cutoff), ("gap_penalty", gap_penalty)):
+            if not isinstance(value, (int, np.integer)) or value > np.iinfo(np.int32).max - 1:
+                raise ValueError(f"`{name}` must be a non-negative integer smaller than 2**31 - 1.")
+        for name, value in (
+            ("gpu_tile_rows", gpu_tile_rows),
+            ("gpu_tile_cols", gpu_tile_cols),
+            ("gpu_tile_buffer_cols", gpu_tile_buffer_cols),
+        ):
+            if value < 1:
+                raise ValueError(f"`{name}` must be >= 1.")
+        self.gpu_tile_rows = gpu_tile_rows
+        self.gpu_tile_cols = gpu_tile_cols
+        self.gpu_tile_buffer_cols = gpu_tile_buffer_cols
+
+    def _gpu_needleman_wunsch_mat(
+        self,
+        *,
+        seqs: Sequence[str],
+        seqs2: Sequence[str],
+        is_symmetric: bool = False,
+        start_column: int = 0,
+    ) -> tuple[list[np.ndarray], list[np.ndarray], np.ndarray, np.ndarray]:
+        """Computes the pairwise Needleman-Wunsch distances for sequences in seqs and seqs2 with GPU support.
+
+        Parameters
+        ----------
+        seqs/2:
+            A python sequence of strings representing gene sequences
+        is_symmetric:
+            Determines whether the final result matrix is symmetric, assuming that this function is
+            only used to compute a block of a bigger result matrix
+        start_column:
+            Global row offset of an outer row block scheduled by joblib. Used to skip column blocks below the diagonal
+            when computing a symmetric result matrix.
+
+        Returns
+        -------
+        data_rows:
+            List with array containing the non-zero data values of the result matrix,
+            needed to create the final scipy CSR result matrix later
+        indices_rows:
+            List with array containing the non-zero entry column indeces of the result matrix,
+            needed to create the final scipy CSR result matrix later
+        row_element_counts:
+            Array with integers that indicate the amount of non-zero values of the result matrix per row,
+            needed to create the final scipy CSR result matrix later
+        row_mins:
+            Always returns a numpy array containing None because the computation of the minimum distance per row is
+            not implemented for the GPU Needleman-Wunsch calculator yet.
+        """
+        import cupy as cp
+        from tqdm import tqdm
+
+        n_col_blocks = (len(seqs2) + self.gpu_tile_cols - 1) // self.gpu_tile_cols
+        n_row_blocks = (len(seqs) + self.gpu_tile_rows - 1) // self.gpu_tile_rows
+
+        seqs_blocks = np.array_split(np.asarray(seqs), n_row_blocks)
+        seqs_block_starts = np.cumsum([0] + [len(block) for block in seqs_blocks[:-1]])
+        seqs_sorted_per_block = []
+        seqs_original_indices_blocks = []
+
+        for seqs_block in seqs_blocks:
+            seqs_block_lengths = np.vectorize(len)(seqs_block)
+            seqs_block_sort_indices = np.argsort(seqs_block_lengths)
+            seqs_sorted_per_block.append(seqs_block[seqs_block_sort_indices])
+            seqs_original_indices_blocks.append(cp.asarray(seqs_block_sort_indices.astype(np.int32)))
+
+        seqs = np.concatenate(seqs_sorted_per_block)
+
+        seqs2_blocks = np.array_split(np.asarray(seqs2), n_col_blocks)
+        seqs2_block_starts = np.cumsum([0] + [len(block) for block in seqs2_blocks[:-1]])
+        seqs2_sorted_per_block = []
+        seqs2_original_indices_blocks = []
+        seqs2_block_start = 0
+
+        for seqs2_block in seqs2_blocks:
+            seqs2_block_lengths = np.vectorize(len)(seqs2_block)
+            seqs2_block_sort_indices = np.argsort(seqs2_block_lengths)
+            seqs2_sorted_per_block.append(seqs2_block[seqs2_block_sort_indices])
+            seqs2_original_indices_blocks.append(
+                cp.asarray((seqs2_block_sort_indices + seqs2_block_start).astype(np.int32))
+            )
+            seqs2_block_start += len(seqs2_block)
+
+        seqs2 = np.concatenate(seqs2_sorted_per_block)
+
+        max_seq_len = max(len(s) for s in itertools.chain(seqs, seqs2))
+
+        seqs_mat1, seqs_L1 = _seqs2mat(seqs, max_len=max_seq_len)
+        seqs_mat2, seqs_L2 = _seqs2mat(seqs2, max_len=max_seq_len)
+        substitution_matrix = self.nw_substitution_matrix
+        d_substitution_matrix = cp.asarray(substitution_matrix.astype(np.int32, copy=False))
+
+        @nb.njit
+        def self_scores(seqs_mat, lengths):
+            scores = np.zeros(len(lengths), dtype=np.int32)
+            for row in range(len(lengths)):
+                for i in range(lengths[row]):
+                    aa = seqs_mat[row, i]
+                    scores[row] += substitution_matrix[aa, aa]
+            return scores
+
+        self_scores1 = self_scores(seqs_mat1, seqs_L1)
+        self_scores2 = self_scores(seqs_mat2, seqs_L2)
+        band_width = max_seq_len if self.gap_penalty == 0 else self.cutoff // self.gap_penalty
+        # Each tile row owns one dynamic programming row in global memory, reused for every sequence pair and tile.
+        # Adjacent threads access adjacent entries at a given dynamic programming position.
+        d_dp_rows = cp.empty((max_seq_len + 1, max(map(len, seqs_blocks))), dtype=cp.int32)
+
+        needleman_wunsch_kernel = cp.RawKernel(
+            r"""
+        extern "C" __global__ __launch_bounds__(256)
+        void needleman_wunsch_kernel(
+            const char* __restrict__ seqs_mat1,
+            const char* __restrict__ seqs_mat2,
+            const int* __restrict__ seqs_L1,
+            const int* __restrict__ seqs_L2,
+            const int* __restrict__ length_starts,
+            const int* __restrict__ length_ends,
+            const int* __restrict__ seqs_original_indices,
+            const int* __restrict__ seqs2_original_indices,
+            const int* __restrict__ self_scores1,
+            const int* __restrict__ self_scores2,
+            const int* __restrict__ substitution_matrix,
+            int* __restrict__ dp_rows,
+            const int alphabet_size,
+            const int gap_penalty,
+            const int band_width,
+            const int cutoff,
+            int* __restrict__ data,
+            int* __restrict__ indices,
+            int* __restrict__ row_element_counts,
+            const int seqs_mat1_rows,
+            const int seqs_mat2_rows,
+            const int buffer_width,
+            const int dp_stride
+        ) {
+            int row = blockDim.x * blockIdx.x + threadIdx.x;
+            if (row >= seqs_mat1_rows) {
+                return;
+            }
+            int original_row = seqs_original_indices[row];
+            int seq1_len = seqs_L1[row];
+            int row_end_index = 0;
+            for (int col = length_starts[seq1_len]; col < length_ends[seq1_len]; col++) {
+                int seq2_len = seqs_L2[col];
+                for (int j = 0; j <= min(band_width, seq2_len); j++) {
+                    dp_rows[(long long)j * dp_stride + row] = -j * gap_penalty;
+                }
+                for (int i = 1; i <= seq1_len; i++) {
+                    int band_start = i - band_width;
+                    int band_end = i + band_width;
+                    int j_start = max(1, band_start);
+                    int j_end = min(seq2_len, band_end);
+                    int diagonal = dp_rows[(long long)(j_start - 1) * dp_stride + row];
+                    int left = -i * gap_penalty;
+                    if (i <= band_width) {
+                        dp_rows[row] = left;
+                    }
+                    int aa1 = seqs_mat1[(long long)(i - 1) * seqs_mat1_rows + row];
+                    for (int j = j_start; j <= j_end; j++) {
+                        int aa2 = seqs_mat2[(long long)(j - 1) * seqs_mat2_rows + col];
+                        int best = diagonal + substitution_matrix[aa1 * alphabet_size + aa2];
+                        // The upper neighbor lies outside the previous band at its right edge.
+                        int above = 0;
+                        if (j < band_end) {
+                            above = dp_rows[(long long)j * dp_stride + row];
+                            best = max(best, above - gap_penalty);
+                        }
+                        if (j > band_start) {
+                            best = max(best, left - gap_penalty);
+                        }
+                        dp_rows[(long long)j * dp_stride + row] = best;
+                        diagonal = above;
+                        left = best;
+                    }
+                }
+                int score = dp_rows[(long long)seq2_len * dp_stride + row];
+                int distance = max(0, min(self_scores1[row], self_scores2[col]) - score) + 1;
+                if (distance <= cutoff + 1) {
+                    if (row_end_index < buffer_width) {
+                        data[(long long)original_row * buffer_width + row_end_index] = distance;
+                        indices[(long long)original_row * buffer_width + row_end_index] = seqs2_original_indices[col];
+                    }
+                    row_end_index++;
+                }
+            }
+            row_element_counts[original_row] = row_end_index;
+        }
+        """,
+            "needleman_wunsch_kernel",
+        )
+
+        create_csr_kernel = cp.RawKernel(
+            r"""
+        extern "C" __global__
+        void create_csr_kernel(
+            int* data, int* indices,
+            int* data_matrix, int* indices_matrix,
+            int* indptr, int data_matrix_rows, int data_matrix_cols, int data_rows, int indices_matrix_cols
+        ) {
+            int row = blockDim.x * blockIdx.x + threadIdx.x;
+            int col = blockDim.y * blockIdx.y + threadIdx.y;
+
+            if (row < data_matrix_rows && col < data_matrix_cols) {
+                int row_start = indptr[row];
+                int row_end = indptr[row + 1];
+                int row_end_index = row_end - row_start;
+                int data_index = row_start + col;
+
+                if ((data_index < data_rows) && (col < row_end_index)) {
+                    data[data_index] = data_matrix[(long long)row * data_matrix_cols + col];
+                    indices[data_index] = indices_matrix[(long long)row * indices_matrix_cols + col];
+                }
+            }
+        }
+            """,
+            "create_csr_kernel",
+        )
+
+        def calc_col_block_gpu(
+            seqs_mat1,
+            seqs_mat2_block,
+            seqs_L1_block,
+            seqs_L2_block,
+            self_scores1_block,
+            self_scores2_block,
+            length_bounds,
+            seqs_original_indices_block,
+            seqs2_original_indices_block,
+            buffer_width,
+        ):
+            d_seqs_L1 = cp.asarray(seqs_L1_block.astype(np.int32, copy=False))
+            d_seqs_L2 = cp.asarray(seqs_L2_block.astype(np.int32, copy=False))
+            d_self_scores1 = cp.asarray(self_scores1_block)
+            d_self_scores2 = cp.asarray(self_scores2_block)
+            d_length_starts, d_length_ends = length_bounds
+
+            threads_per_block = 256
+            blocks_per_grid = (seqs_mat1.shape[0] + (threads_per_block - 1)) // threads_per_block
+
+            seqs_mat1_rows = seqs_mat1.shape[0]
+            seqs_mat2_rows = seqs_mat2_block.shape[0]
+
+            d_seqs_mat1_transposed = cp.transpose(cp.asarray(seqs_mat1.astype(np.int8, copy=False))).copy()
+            d_seqs_mat2_transposed = cp.transpose(cp.asarray(seqs_mat2_block.astype(np.int8, copy=False))).copy()
+
+            def run_needleman_wunsch_kernel(buffer_width):
+                d_data_matrix = cp.empty((seqs_mat1_rows, buffer_width), dtype=cp.int32)
+                d_indices_matrix = cp.empty((seqs_mat1_rows, buffer_width), dtype=np.int32)
+                d_row_element_counts = cp.zeros(seqs_mat1_rows, dtype=np.int32)
+
+                needleman_wunsch_kernel(
+                    (blocks_per_grid,),
+                    (threads_per_block,),
+                    (
+                        d_seqs_mat1_transposed,
+                        d_seqs_mat2_transposed,
+                        d_seqs_L1,
+                        d_seqs_L2,
+                        d_length_starts,
+                        d_length_ends,
+                        seqs_original_indices_block,
+                        seqs2_original_indices_block,
+                        d_self_scores1,
+                        d_self_scores2,
+                        d_substitution_matrix,
+                        d_dp_rows,
+                        substitution_matrix.shape[0],
+                        self.gap_penalty,
+                        band_width,
+                        self.cutoff,
+                        d_data_matrix,
+                        d_indices_matrix,
+                        d_row_element_counts,
+                        seqs_mat1_rows,
+                        seqs_mat2_rows,
+                        buffer_width,
+                        d_dp_rows.shape[1],
+                    ),
+                )
+                row_element_counts = d_row_element_counts.get()
+                required_buffer_width = int(np.max(row_element_counts))
+                if required_buffer_width > buffer_width:
+                    # Release undersized buffers before allocating larger ones for the retry.
+                    d_data_matrix = None
+                    d_indices_matrix = None
+                return d_data_matrix, d_indices_matrix, row_element_counts, required_buffer_width
+
+            d_data_matrix, d_indices_matrix, row_element_counts, required_buffer_width = run_needleman_wunsch_kernel(
+                buffer_width
+            )
+
+            if required_buffer_width > buffer_width:
+                # The buffer was too small, so retry with the required buffer size.
+                logging.info(
+                    f"GPU Needleman-Wunsch tile buffer increased from {buffer_width} to {required_buffer_width}; "
+                    f"retrying the {seqs_mat1_rows} x {seqs_mat2_rows} tile."
+                )
+                buffer_width = required_buffer_width
+                d_data_matrix, d_indices_matrix, row_element_counts, _ = run_needleman_wunsch_kernel(buffer_width)
+
+            row_element_sum = np.sum(row_element_counts, dtype=np.int64)
+
+            if row_element_sum > np.iinfo(np.int32).max:
+                raise ValueError(
+                    "There are too many result values to be held by the resulting CSR matrix of the current block. "
+                    f"Current number: {row_element_sum}, maximum number: {np.iinfo(np.int32).max}. "
+                    "Consider choosing a smaller cutoff to resolve this issue."
+                )
+
+            indptr = np.zeros(seqs_mat1.shape[0] + 1, dtype=np.int32)
+            indptr[1:] = np.cumsum(row_element_counts)
+            d_indptr = cp.asarray(indptr)
+
+            n_elements = indptr[-1]
+            d_data = cp.zeros(n_elements, dtype=cp.int32)
+            d_indices = cp.zeros(n_elements, dtype=cp.int32)
+
+            threads_per_block = (1, 256)
+            blocks_per_grid_x = (d_data_matrix.shape[0] + threads_per_block[0] - 1) // threads_per_block[0]
+            blocks_per_grid_y = (d_data_matrix.shape[1] + threads_per_block[1] - 1) // threads_per_block[1]
+            blocks_per_grid = (blocks_per_grid_x, blocks_per_grid_y)
+
+            create_csr_kernel(
+                (blocks_per_grid_x, blocks_per_grid_y),
+                threads_per_block,
+                (
+                    d_data,
+                    d_indices,
+                    d_data_matrix,
+                    d_indices_matrix,
+                    d_indptr,
+                    d_data_matrix.shape[0],
+                    d_data_matrix.shape[1],
+                    d_data.shape[0],
+                    d_indices_matrix.shape[1],
+                ),
+            )
+
+            data = d_data.get()
+            indices = d_indices.get()
+
+            res = csr_matrix((data, indices, indptr), shape=(seqs_mat1.shape[0], seqs_mat2.shape[0]))
+            return res, buffer_width
+
+        seqs_mat1_blocks = np.array_split(seqs_mat1, n_row_blocks)
+        seqs_L1_blocks = np.array_split(seqs_L1, n_row_blocks)
+        seqs_mat2_blocks = np.array_split(seqs_mat2, n_col_blocks)
+        seqs_L2_blocks = np.array_split(seqs_L2, n_col_blocks)
+
+        self_scores1_blocks = np.array_split(self_scores1, n_row_blocks)
+        self_scores2_blocks = np.array_split(self_scores2, n_col_blocks)
+
+        possible_lengths = np.arange(max_seq_len + 1)
+        length_bounds_blocks = [
+            (
+                cp.asarray(np.searchsorted(lengths, possible_lengths - band_width, side="left").astype(np.int32)),
+                cp.asarray(np.searchsorted(lengths, possible_lengths + band_width, side="right").astype(np.int32)),
+            )
+            for lengths in seqs_L2_blocks
+        ]
+
+        logging.info(f"\nStart GPU calculations for {n_row_blocks} row tiles x {n_col_blocks} column tiles:")
+
+        @nb.njit
+        def csr_union_numba(block_data, block_indices, block_indptrs, num_rows, num_elements):
+            data = np.empty(num_elements, dtype=block_data[0].dtype)
+            indices = np.empty(num_elements, dtype=block_indices[0].dtype)
+            indptr = np.zeros(num_rows + 1, dtype=np.int32)
+
+            ptr = 0
+            for row in range(num_rows):
+                for b in range(len(block_indptrs)):
+                    start = block_indptrs[b][row]
+                    end = block_indptrs[b][row + 1]
+                    count = end - start
+
+                    for j in range(count):
+                        data[ptr + j] = block_data[b][start + j]
+                        indices[ptr + j] = block_indices[b][start + j]
+
+                    ptr += count
+                indptr[row + 1] = ptr
+
+            return data, indices, indptr
+
+        def csr_union(blocks):
+            num_rows = blocks[0].shape[0]
+            num_elements = sum(b.nnz for b in blocks)
+
+            block_data = [b.data for b in blocks]
+            block_indices = [b.indices for b in blocks]
+            block_indptrs = [b.indptr for b in blocks]
+
+            data, indices, indptr = csr_union_numba(block_data, block_indices, block_indptrs, num_rows, num_elements)
+
+            shape = blocks[0].shape
+            result = csr_matrix((data, indices, indptr), shape=shape)
+            return result
+
+        def skip_col_block(row_block_idx, col_block_idx):
+            row_start = start_column + seqs_block_starts[row_block_idx]
+            col_end = seqs2_block_starts[col_block_idx] + seqs_mat2_blocks[col_block_idx].shape[0]
+            return is_symmetric and col_end <= row_start
+
+        def count_blocks_to_compute():
+            n_blocks_to_compute = 0
+            for row_block_idx in range(n_row_blocks):
+                for col_block_idx in range(n_col_blocks):
+                    if not skip_col_block(row_block_idx, col_block_idx):
+                        n_blocks_to_compute += 1
+            return n_blocks_to_compute
+
+        def calc_row_block_gpu(
+            row_block_idx,
+            seqs_mat1_block,
+            seqs_L1_block,
+            seqs_original_indices_block,
+            buffer_width,
+        ):
+            result_blocks = []
+            n_calculated_blocks = 0
+
+            for i in range(0, n_col_blocks):
+                # Skip calculation of blocks below the diagonal if the result matrix is symmetric.
+                if skip_col_block(row_block_idx, i):
+                    continue
+
+                result_block, buffer_width = calc_col_block_gpu(
+                    seqs_mat1_block,
+                    seqs_mat2_blocks[i],
+                    seqs_L1_block,
+                    seqs_L2_blocks[i],
+                    self_scores1_blocks[row_block_idx],
+                    self_scores2_blocks[i],
+                    length_bounds_blocks[i],
+                    seqs_original_indices_block,
+                    seqs2_original_indices_blocks[i],
+                    buffer_width,
+                )
+                result_blocks.append(result_block)
+                n_calculated_blocks += 1
+
+            if not result_blocks:
+                return (
+                    csr_matrix((seqs_mat1_block.shape[0], seqs_mat2.shape[0]), dtype=np.int32),
+                    n_calculated_blocks,
+                    buffer_width,
+                )
+
+            num_elements = sum(int(block.indptr[-1]) for block in result_blocks)
+
+            if num_elements > np.iinfo(np.int32).max:
+                raise ValueError(
+                    "The overall number of result values is too high to construct the final CSR matrix by combining "
+                    "the already calculated blocks. "
+                    f"Current number: {num_elements}, maximum number: {np.iinfo(np.int32).max}. "
+                    "Consider choosing a smaller cutoff to resolve this issue."
+                )
+
+            result_sparse = csr_union(result_blocks)
+            result_sparse.sort_indices()
+            return result_sparse, n_calculated_blocks, buffer_width
+
+        row_blocks = [None] * n_row_blocks
+        buffer_width = self.gpu_tile_buffer_cols
+        with tqdm(total=count_blocks_to_compute(), desc="Processing", unit="block") as progress_bar:
+            for row_block_idx in range(n_row_blocks):
+                row_blocks[row_block_idx], n_calculated_blocks, buffer_width = calc_row_block_gpu(
+                    row_block_idx,
+                    seqs_mat1_blocks[row_block_idx],
+                    seqs_L1_blocks[row_block_idx],
+                    seqs_original_indices_blocks[row_block_idx],
+                    buffer_width,
+                )
+                progress_bar.update(n_calculated_blocks)
+
+        result_sparse = scipy.sparse.vstack(row_blocks, format="csr")
+
+        row_element_counts_gpu = np.diff(result_sparse.indptr)
+        result_sparse.sort_indices()
+
+        # Returns the results in a way that fits the current interface, could be improved later
+        return [result_sparse.data], [result_sparse.indices], row_element_counts_gpu, np.array([None])
+
+    _metric_mat = _gpu_needleman_wunsch_mat
+
+
 @deprecated(
     Deprecation(
         "0.15.0",

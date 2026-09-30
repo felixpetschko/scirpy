@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning][].
 
 ## Unreleased
 
+### Features
+
+  - Add `metric="gpu_needleman_wunsch"` for GPU-accelerated linear-gap Needleman-Wunsch distances,
+    with row and column tiling and adaptive result buffers.
+
 ### Fixes
 
   - Avoid deprecated AnnData `obsm_keys()` calls when plotting clonotype networks or exporting them to igraph.

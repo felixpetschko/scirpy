@@ -49,9 +49,11 @@ with joblib.parallel_config(backend="dask", n_jobs=200, verbose=10):
     )
 ```
 
-## Using GPU acceleration for hamming distance
+## Using GPU acceleration
 
-The Hamming distance metric supports GPU acceleration via [cupy](https://cupy.dev/).
+The Hamming and Needleman-Wunsch distance metrics support GPU acceleration via [cupy](https://cupy.dev/),
+using `metric="gpu_hamming"` and `metric="gpu_needleman_wunsch"`, respectively.
+The following examples use Hamming distance.
 
 First, install the optional `cupy` dependency:
 

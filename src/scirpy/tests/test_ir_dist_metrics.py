@@ -13,6 +13,7 @@ from scirpy.ir_dist.metrics import (
     DistanceCalculator,
     FastAlignmentDistanceCalculator,
     GPUHammingDistanceCalculator,
+    GPUNeedlemanWunschDistanceCalculator,
     HammingDistanceCalculator,
     IdentityDistanceCalculator,
     LevenshteinDistanceCalculator,
@@ -1007,9 +1008,17 @@ def test_tcrdist(test_parameters, test_input, expected_result):
         ),
     ],
 )
-def test_needleman_wunsch(test_parameters, test_input, expected_result):
+@pytest.mark.parametrize(
+    "calculator",
+    [NeedlemanWunschDistanceCalculator, pytest.param(GPUNeedlemanWunschDistanceCalculator, marks=pytest.mark.gpu)],
+)
+def test_needleman_wunsch(test_parameters, test_input, expected_result, calculator):
     # Check direct calculator results for small edge cases and parameter combinations.
-    needleman_wunsch_calculator = NeedlemanWunschDistanceCalculator(**test_parameters)
+    test_parameters = test_parameters.copy()
+    if calculator is GPUNeedlemanWunschDistanceCalculator:
+        test_parameters.pop("n_jobs", None)
+        test_parameters.update(gpu_tile_rows=2, gpu_tile_cols=3, gpu_tile_buffer_cols=1)
+    needleman_wunsch_calculator = calculator(**test_parameters)
     seq1, seq2 = test_input
 
     res = needleman_wunsch_calculator.calc_dist_mat(seq1, seq2)
@@ -1355,3 +1364,178 @@ def test_gpu_hamming_reference(kwargs):
     assert np.array_equal(res.indices, reference_result.indices)
     assert np.array_equal(res.indptr, reference_result.indptr)
     assert np.array_equal(res.todense(), reference_result.todense())
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "test_parameters,test_input,expected_result",
+    [
+        # Symmetric matrix with multiple row and column tiles and unsorted sequence lengths.
+        (
+            {"cutoff": 8, "gpu_tile_rows": 2, "gpu_tile_cols": 2},
+            (np.array(["AAA", "A", "AA", "AAAA"]), None),
+            np.array([[1, 9, 5, 5], [9, 1, 5, 0], [5, 5, 1, 9], [5, 0, 9, 1]]),
+        ),
+        # Unequal tile dimensions with a partially filled final tile.
+        (
+            {"cutoff": 8, "gpu_tile_rows": 3, "gpu_tile_cols": 2},
+            (np.array(["AAA", "A", "AA", "AAAA"]), None),
+            np.array([[1, 9, 5, 5], [9, 1, 5, 0], [5, 5, 1, 9], [5, 0, 9, 1]]),
+        ),
+        # Multiple outer partitions preserve global column indices and symmetry.
+        (
+            {"cutoff": 8, "n_blocks": 3, "gpu_tile_rows": 1, "gpu_tile_cols": 3},
+            (np.array(["AAA", "A", "AA", "AAAA"]), None),
+            np.array([[1, 9, 5, 5], [9, 1, 5, 0], [5, 5, 1, 9], [5, 0, 9, 1]]),
+        ),
+        # Rectangular input preserves row and column order and rows without retained distances.
+        (
+            {"cutoff": 8, "gpu_tile_rows": 2, "gpu_tile_cols": 3},
+            (np.array(["AAA", "A", "WW"]), np.array(["AAAA", "AA", "A", "AAA"])),
+            np.array([[5, 5, 9, 1], [0, 5, 1, 9], [0, 0, 0, 0]]),
+        ),
+        # Rectangular input split into outer partitions and single-column tiles.
+        (
+            {"cutoff": 8, "n_blocks": 2, "gpu_tile_rows": 2, "gpu_tile_cols": 1},
+            (np.array(["AAA", "A", "WW"]), np.array(["AAAA", "AA", "A", "AAA"])),
+            np.array([[5, 5, 9, 1], [0, 5, 1, 9], [0, 0, 0, 0]]),
+        ),
+        # Tiles larger than the input retain duplicate sequences as separate rows and columns.
+        (
+            {"cutoff": 8, "gpu_tile_rows": 20, "gpu_tile_cols": 20},
+            (np.array(["AA", "A", "AA"]), None),
+            np.array([[1, 5, 1], [5, 1, 5], [1, 5, 1]]),
+        ),
+        # Tiles with no retained distances still produce the requested matrix shape.
+        (
+            {"cutoff": 8, "gpu_tile_rows": 1, "gpu_tile_cols": 1},
+            (np.array(["AA", "AAA"]), np.array(["WW", "WWW"])),
+            np.zeros((2, 2), dtype=np.int32),
+        ),
+    ],
+)
+def test_gpu_needleman_wunsch(test_parameters, test_input, expected_result):
+    calculator = GPUNeedlemanWunschDistanceCalculator(**test_parameters)
+    result = calculator.calc_dist_mat(*test_input)
+
+    assert isinstance(result, scipy.sparse.csr_matrix)
+    assert result.dtype == np.dtype("int32")
+    npt.assert_array_equal(result.toarray(), expected_result)
+
+
+@pytest.mark.gpu
+def test_gpu_needleman_wunsch_buffer_retry():
+    # Four retained distances per row exceed the initial buffer width of one.
+    calculator = GPUNeedlemanWunschDistanceCalculator(
+        cutoff=8, gpu_tile_rows=2, gpu_tile_cols=4, gpu_tile_buffer_cols=1
+    )
+    result = calculator.calc_dist_mat(np.array(["AAA", "AA"]), np.array(["AAAA", "AA", "A", "AAA"]))
+    npt.assert_array_equal(result.toarray(), np.array([[5, 5, 9, 1], [9, 1, 5, 5]]))
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "gap_penalty,cutoff",
+    [
+        # Zero cutoff restricts the alignment to the diagonal.
+        (4, 0),
+        # A cutoff below one gap penalty still restricts the alignment to the diagonal.
+        (4, 3),
+        # One gap position is allowed exactly at the cutoff boundary.
+        (4, 4),
+        # A cutoff between gap-penalty multiples must not widen the band prematurely.
+        (4, 7),
+        # Two gap positions are allowed exactly at the cutoff boundary.
+        (4, 8),
+        # Free gaps require evaluating the full alignment matrix.
+        (0, 10),
+    ],
+)
+def test_gpu_needleman_wunsch_band_boundaries(gap_penalty, cutoff):
+    # Reusing the workspace across unequal lengths must preserve values at both band edges.
+    seqs = np.array(["ARNDC", "A", "AR", "ARN", "ARNDCQ", "ARNDC", "WW"])
+    seqs2 = np.array(["ARNDCQEG", "ARND", "A", "WW", "W"])
+    expected = NeedlemanWunschDistanceCalculator(gap_penalty=gap_penalty, cutoff=cutoff, n_jobs=1).calc_dist_mat(
+        seqs, seqs2
+    )
+    result = GPUNeedlemanWunschDistanceCalculator(
+        gap_penalty=gap_penalty, cutoff=cutoff, gpu_tile_rows=3, gpu_tile_cols=4
+    ).calc_dist_mat(seqs, seqs2)
+    npt.assert_array_equal(result.toarray(), expected.toarray())
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("gap_penalty", [0, 4])
+@pytest.mark.parametrize(
+    "seqs,seqs2",
+    [
+        # Empty sequences mixed with non-empty sequences in a symmetric matrix.
+        (["", "A", "AAA", ""], None),
+        # Empty sequences on both axes of a rectangular matrix.
+        (["AA", "", "A"], ["", "AAA", "A", "AAAA"]),
+        # All sequences are empty, so the workspace contains only the boundary position.
+        (["", ""], [""]),
+    ],
+)
+def test_gpu_needleman_wunsch_empty_sequences(gap_penalty, seqs, seqs2):
+    expected = NeedlemanWunschDistanceCalculator(gap_penalty=gap_penalty, n_jobs=1).calc_dist_mat(seqs, seqs2)
+    result = GPUNeedlemanWunschDistanceCalculator(
+        gap_penalty=gap_penalty, gpu_tile_rows=2, gpu_tile_cols=3
+    ).calc_dist_mat(seqs, seqs2)
+    npt.assert_array_equal(result.toarray(), expected.toarray())
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {},
+        {"n_blocks": 3, "gpu_tile_rows": 137, "gpu_tile_cols": 101, "gpu_tile_buffer_cols": 1},
+    ],
+)
+def test_gpu_needleman_wunsch_reference(kwargs):
+    # Compare with the existing independent parasail reference, including uneven tile boundaries.
+    from . import TESTDATA
+
+    seqs = np.load(TESTDATA / "needleman_wunsch_test_data/needleman_wunsch_WU3k_seqs.npy")
+    expected = scipy.sparse.load_npz(TESTDATA / "needleman_wunsch_test_data/needleman_wunsch_WU3k_csr_result.npz")
+    result = GPUNeedlemanWunschDistanceCalculator(cutoff=20, **kwargs).calc_dist_mat(seqs)
+    npt.assert_array_equal(result.data, expected.data)
+    npt.assert_array_equal(result.indices, expected.indices)
+    npt.assert_array_equal(result.indptr, expected.indptr)
+
+
+@pytest.mark.gpu
+def test_gpu_needleman_wunsch_long_sequences():
+    # Sequence lengths exceeding the int8 range and encoded distances exceeding 255.
+    seqs = ["A" * 128, "A" * 129, "W" * 128]
+    expected = NeedlemanWunschDistanceCalculator(cutoff=2000, n_jobs=1).calc_dist_mat(seqs)
+    result = GPUNeedlemanWunschDistanceCalculator(
+        cutoff=2000, gpu_tile_rows=2, gpu_tile_cols=2, gpu_tile_buffer_cols=1
+    ).calc_dist_mat(seqs)
+    npt.assert_array_equal(result.toarray(), expected.toarray())
+
+
+@pytest.mark.parametrize("cutoff", [-1, 1.5, np.iinfo(np.int32).max])
+def test_gpu_needleman_wunsch_cutoff_guard(cutoff):
+    with pytest.raises(ValueError, match="`cutoff`"):
+        GPUNeedlemanWunschDistanceCalculator(cutoff=cutoff)
+
+
+@pytest.mark.parametrize(
+    "kwargs,message",
+    [
+        ({"gpu_tile_rows": 0}, "`gpu_tile_rows` must be >= 1."),
+        ({"gpu_tile_cols": 0}, "`gpu_tile_cols` must be >= 1."),
+        ({"gpu_tile_buffer_cols": 0}, "`gpu_tile_buffer_cols` must be >= 1."),
+    ],
+)
+def test_gpu_needleman_wunsch_tile_parameter_guards(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        GPUNeedlemanWunschDistanceCalculator(**kwargs)
+
+
+@pytest.mark.parametrize("gap_penalty", [-1, 1.5, np.iinfo(np.int32).max])
+def test_gpu_needleman_wunsch_gap_penalty_guard(gap_penalty):
+    with pytest.raises(ValueError, match="`gap_penalty`"):
+        GPUNeedlemanWunschDistanceCalculator(gap_penalty=gap_penalty)

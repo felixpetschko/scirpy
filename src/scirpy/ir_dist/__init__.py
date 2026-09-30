@@ -40,6 +40,7 @@ MetricType = (
         "normalized_hamming",
         "tcrdist",
         "needleman_wunsch",
+        "gpu_needleman_wunsch",
     ]
     | metrics.DistanceCalculator
 )
@@ -60,6 +61,8 @@ metric
         Uses the BLOSUM62 substitution matrix.
         This option is incompatible with nucleotide sequences.
         See :class:`~scirpy.ir_dist.metrics.NeedlemanWunschDistanceCalculator`.
+      * `gpu_needleman_wunsch` -- GPU-accelerated linear-gap Needleman-Wunsch distance for amino acid sequences.
+        See :class:`~scirpy.ir_dist.metrics.GPUNeedlemanWunschDistanceCalculator`.
       * `hamming` -- Hamming distance for CDR3 sequences of equal length.
         See :class:`~scirpy.ir_dist.metrics.HammingDistanceCalculator`.
       * `gpu_hamming` -- Hamming distance for CDR3 sequences of equal length calculated with a GPU.
@@ -83,7 +86,7 @@ cutoff
     All distances `> cutoff` will be replaced by `0` and eliminated from the sparse
     matrix. A sensible cutoff depends on the distance metric, you can find
     information in the corresponding docs. If set to `None`, the cutoff
-    will be `10` for the `alignment`, `fastalignment`, and `needleman_wunsch` metric,
+    will be `10` for the `alignment`, `fastalignment`, `needleman_wunsch`, and `gpu_needleman_wunsch` metrics,
     and `2` for `levenshtein` and `hamming`.
     For the identity metric, the cutoff is ignored and always set to `0`.
 """
@@ -127,6 +130,8 @@ def _get_distance_calculator(
         dist_calc = metrics.GPUHammingDistanceCalculator(**kwargs)
     elif metric == "tcrdist":
         dist_calc = metrics.TCRdistDistanceCalculator(n_jobs=n_jobs, chain_type=chain_type, **kwargs)
+    elif metric == "gpu_needleman_wunsch":
+        dist_calc = metrics.GPUNeedlemanWunschDistanceCalculator(**kwargs)
     elif metric == "needleman_wunsch":
         dist_calc = metrics.NeedlemanWunschDistanceCalculator(n_jobs=n_jobs, **kwargs)
     else:

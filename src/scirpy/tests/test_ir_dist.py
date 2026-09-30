@@ -198,6 +198,41 @@ def test_ir_dist_gpu_hamming(adata_cdr3):
     )
 
 
+@pytest.mark.gpu
+def test_ir_dist_gpu_needleman_wunsch(adata_cdr3):
+    expected_seq_vj = np.array(["AAA", "AHA"])
+    expected_seq_vdj = np.array(["AAA", "KK", "KKK", "KKY", "LLL"])
+    ir.pp.ir_dist(
+        adata_cdr3,
+        metric="gpu_needleman_wunsch",
+        sequence="aa",
+        cutoff=10,
+        gpu_tile_rows=1,
+        gpu_tile_cols=1,
+        gpu_tile_buffer_cols=3,
+    )
+    res = (
+        adata_cdr3.mod["airr"].uns["ir_dist_aa_gpu_needleman_wunsch"]
+        if isinstance(adata_cdr3, MuData)
+        else adata_cdr3.uns["ir_dist_aa_gpu_needleman_wunsch"]
+    )
+    npt.assert_array_equal(res["VJ"]["seqs"], expected_seq_vj)
+    npt.assert_array_equal(res["VDJ"]["seqs"], expected_seq_vdj)
+    npt.assert_array_equal(res["VJ"]["distances"].toarray(), np.array([[1, 7], [7, 1]]))
+    npt.assert_array_equal(
+        res["VDJ"]["distances"].toarray(),
+        np.array(
+            [
+                [1, 0, 0, 0, 0],
+                [0, 1, 5, 5, 0],
+                [0, 5, 1, 8, 0],
+                [0, 5, 8, 1, 0],
+                [0, 0, 0, 0, 1],
+            ]
+        ),
+    )
+
+
 @pytest.mark.parametrize("mudata", [False, True], ids=["AnnData", "MuData"])
 def test_ir_dist_tcrdist_tcrblosum_chain_routing(mudata):
     # `ir_dist` should automatically route VJ to TCRBLOSUM alpha and VDJ to beta.
