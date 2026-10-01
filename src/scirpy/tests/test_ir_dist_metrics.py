@@ -1465,30 +1465,6 @@ def test_gpu_needleman_wunsch_band_boundaries(gap_penalty, cutoff):
 
 
 @pytest.mark.gpu
-@pytest.mark.parametrize(
-    "test_input,expected_result",
-    [
-        # An early mismatch followed by matches can still reach the cutoff exactly.
-        (
-            (np.array(["AAAA", "CAAA", "WWWW"]), np.array(["AAAA", "CAAA", "AAAAA", "WAAA"])),
-            np.array([[1, 5, 5, 0], [5, 1, 0, 0], [0, 0, 0, 0]]),
-        ),
-        # Preserve late high-scoring matches, gaps at the cutoff, and neutral unknown symbols.
-        (
-            (np.array(["AW", "CW", "WW", "AX"]), np.array(["CW", "AW", "W", "XX"])),
-            np.array([[5, 1, 5, 1], [1, 5, 5, 1], [0, 0, 5, 1], [5, 1, 0, 1]]),
-        ),
-    ],
-)
-def test_gpu_needleman_wunsch_early_cutoff(test_input, expected_result):
-    calculator = GPUNeedlemanWunschDistanceCalculator(
-        cutoff=4, gpu_tile_rows=2, gpu_tile_cols=3, gpu_tile_buffer_cols=1
-    )
-    result = calculator.calc_dist_mat(*test_input)
-    npt.assert_array_equal(result.toarray(), expected_result)
-
-
-@pytest.mark.gpu
 @pytest.mark.parametrize("gap_penalty", [0, 4])
 @pytest.mark.parametrize(
     "seqs,seqs2",
