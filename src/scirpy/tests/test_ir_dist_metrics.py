@@ -1412,6 +1412,18 @@ def test_gpu_hamming_reference(kwargs):
             (np.array(["AA", "AAA"]), np.array(["WW", "WWW"])),
             np.zeros((2, 2), dtype=np.int32),
         ),
+        # An early mismatch followed by matches can still reach the cutoff exactly.
+        (
+            {"cutoff": 4, "gpu_tile_rows": 2, "gpu_tile_cols": 3, "gpu_tile_buffer_cols": 1},
+            (np.array(["AAAA", "CAAA", "WWWW"]), np.array(["AAAA", "CAAA", "AAAAA", "WAAA"])),
+            np.array([[1, 5, 5, 0], [5, 1, 0, 0], [0, 0, 0, 0]]),
+        ),
+        # Preserve late high-scoring matches, gaps at the cutoff, and neutral unknown symbols.
+        (
+            {"cutoff": 4, "gpu_tile_rows": 2, "gpu_tile_cols": 3, "gpu_tile_buffer_cols": 1},
+            (np.array(["AW", "CW", "WW", "AX"]), np.array(["CW", "AW", "W", "XX"])),
+            np.array([[5, 1, 5, 1], [1, 5, 5, 1], [0, 0, 5, 1], [5, 1, 0, 1]]),
+        ),
     ],
 )
 def test_gpu_needleman_wunsch(test_parameters, test_input, expected_result):
