@@ -1939,9 +1939,9 @@ class GPUNeedlemanWunschDistanceCalculator(NeedlemanWunschDistanceCalculator):
         self_scores1 = self_scores(seqs_mat1, seqs_L1)
         self_scores2 = self_scores(seqs_mat2, seqs_L2)
         band_width = max_seq_len if self.gap_penalty == 0 else self.cutoff // self.gap_penalty
-        # A five-position band uses registers; other band widths retain the global-memory workspace.
-        use_register_band = band_width == 2
-        d_dp_rows = cp.empty((0 if use_register_band else max_seq_len + 1, max(map(len, seqs_blocks))), dtype=cp.int32)
+        # Each tile row owns one dynamic programming row in global memory, reused for every sequence pair and tile.
+        # Adjacent threads access adjacent entries at a given dynamic programming position.
+        d_dp_rows = cp.empty((max_seq_len + 1, max(map(len, seqs_blocks))), dtype=cp.int32)
 
         needleman_wunsch_kernel = cp.RawKernel(
             r"""
@@ -1980,80 +1980,38 @@ class GPUNeedlemanWunschDistanceCalculator(NeedlemanWunschDistanceCalculator):
             int row_end_index = 0;
             for (int col = length_starts[seq1_len]; col < length_ends[seq1_len]; col++) {
                 int seq2_len = seqs_L2[col];
-                int score;
-                if (REGISTER_BAND) {
-                    const int unreachable = (-2147483647 - 1);
-                    // Fixed indices and unrolling let the compiler keep the dynamic programming band in registers.
-                    int band[5] = {unreachable, unreachable, 0, -gap_penalty, -2 * gap_penalty};
-                    for (int i = 1; i <= seq1_len; i++) {
-                        int aa1 = seqs_mat1[(long long)(i - 1) * seqs_mat1_rows + row];
-                        int left = unreachable;
-                        #pragma unroll
-                        for (int k = 0; k < 5; k++) {
-                            int j = i - 2 + k;
-                            int best = unreachable;
-                            if (j == 0) {
-                                best = -i * gap_penalty;
-                            } else if (j > 0 && j <= seq2_len) {
-                                int aa2 = seqs_mat2[(long long)(j - 1) * seqs_mat2_rows + col];
-                                if (band[k] != unreachable) {
-                                    best = band[k] + substitution_matrix[aa1 * alphabet_size + aa2];
-                                }
-                                if (k < 4) {
-                                    if (band[k + 1] != unreachable) {
-                                        best = max(best, band[k + 1] - gap_penalty);
-                                    }
-                                }
-                                if (left != unreachable) {
-                                    best = max(best, left - gap_penalty);
-                                }
-                            }
-                            // The old value at k + 1 is still available for the next position.
-                            band[k] = best;
-                            left = best;
-                        }
-                    }
-                    score = unreachable;
-                    #pragma unroll
-                    for (int k = 0; k < 5; k++) {
-                        if (k == seq2_len - seq1_len + 2) {
-                            score = band[k];
-                        }
-                    }
-                } else {
-                    for (int j = 0; j <= min(band_width, seq2_len); j++) {
-                        dp_rows[(long long)j * dp_stride + row] = -j * gap_penalty;
-                    }
-                    for (int i = 1; i <= seq1_len; i++) {
-                        int band_start = i - band_width;
-                        int band_end = i + band_width;
-                        int j_start = max(1, band_start);
-                        int j_end = min(seq2_len, band_end);
-                        int diagonal = dp_rows[(long long)(j_start - 1) * dp_stride + row];
-                        int left = -i * gap_penalty;
-                        if (i <= band_width) {
-                            dp_rows[row] = left;
-                        }
-                        int aa1 = seqs_mat1[(long long)(i - 1) * seqs_mat1_rows + row];
-                        for (int j = j_start; j <= j_end; j++) {
-                            int aa2 = seqs_mat2[(long long)(j - 1) * seqs_mat2_rows + col];
-                            int best = diagonal + substitution_matrix[aa1 * alphabet_size + aa2];
-                            // The upper neighbor lies outside the previous band at its right edge.
-                            int above = 0;
-                            if (j < band_end) {
-                                above = dp_rows[(long long)j * dp_stride + row];
-                                best = max(best, above - gap_penalty);
-                            }
-                            if (j > band_start) {
-                                best = max(best, left - gap_penalty);
-                            }
-                            dp_rows[(long long)j * dp_stride + row] = best;
-                            diagonal = above;
-                            left = best;
-                        }
-                    }
-                    score = dp_rows[(long long)seq2_len * dp_stride + row];
+                for (int j = 0; j <= min(band_width, seq2_len); j++) {
+                    dp_rows[(long long)j * dp_stride + row] = -j * gap_penalty;
                 }
+                for (int i = 1; i <= seq1_len; i++) {
+                    int band_start = i - band_width;
+                    int band_end = i + band_width;
+                    int j_start = max(1, band_start);
+                    int j_end = min(seq2_len, band_end);
+                    int diagonal = dp_rows[(long long)(j_start - 1) * dp_stride + row];
+                    int left = -i * gap_penalty;
+                    if (i <= band_width) {
+                        dp_rows[row] = left;
+                    }
+                    int aa1 = seqs_mat1[(long long)(i - 1) * seqs_mat1_rows + row];
+                    for (int j = j_start; j <= j_end; j++) {
+                        int aa2 = seqs_mat2[(long long)(j - 1) * seqs_mat2_rows + col];
+                        int best = diagonal + substitution_matrix[aa1 * alphabet_size + aa2];
+                        // The upper neighbor lies outside the previous band at its right edge.
+                        int above = 0;
+                        if (j < band_end) {
+                            above = dp_rows[(long long)j * dp_stride + row];
+                            best = max(best, above - gap_penalty);
+                        }
+                        if (j > band_start) {
+                            best = max(best, left - gap_penalty);
+                        }
+                        dp_rows[(long long)j * dp_stride + row] = best;
+                        diagonal = above;
+                        left = best;
+                    }
+                }
+                int score = dp_rows[(long long)seq2_len * dp_stride + row];
                 int distance = max(0, min(self_scores1[row], self_scores2[col]) - score) + 1;
                 if (distance <= cutoff + 1) {
                     if (row_end_index < buffer_width) {
@@ -2067,7 +2025,6 @@ class GPUNeedlemanWunschDistanceCalculator(NeedlemanWunschDistanceCalculator):
         }
         """,
             "needleman_wunsch_kernel",
-            options=(f"-DREGISTER_BAND={int(use_register_band)}",),
         )
 
         create_csr_kernel = cp.RawKernel(
