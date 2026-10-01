@@ -1939,10 +1939,19 @@ class GPUNeedlemanWunschDistanceCalculator(NeedlemanWunschDistanceCalculator):
         self_scores1 = self_scores(seqs_mat1, seqs_L1)
         self_scores2 = self_scores(seqs_mat2, seqs_L2)
         band_width = max_seq_len if self.gap_penalty == 0 else self.cutoff // self.gap_penalty
-        # Each tile row owns one dynamic programming row in global memory, reused for every sequence pair and tile.
-        # Adjacent threads access adjacent entries at a given dynamic programming position.
-        d_dp_rows = cp.empty((max_seq_len + 1, max(map(len, seqs_blocks))), dtype=cp.int32)
+        # Positions beyond the longest sequence cannot occur in an alignment.
+        band_width = min(band_width, max_seq_len)
 
+        # Optimizations in the Needleman-Wunsch kernel:
+        # Only a diagonal band of the dynamic programming matrix is evaluated: positions outside it require enough
+        # gaps to exceed the cutoff through gap penalties alone. With free gaps, the band covers the full alignment matrix.
+        # Each thread reuses one dynamic programming band for successive sequence pairs, storing the required values
+        # from the previous row and overwriting them with values from the current row of the dynamic programming matrix.
+        # Its compile-time size and unrolled loops allow the compiler to keep small bands in registers, avoiding a global workspace.
+        # The self-alignment score of the remaining amino acids in the first sequence sets an upper limit for the best possible
+        # score that can be reached by aligning those amino acids.
+        # An alignment computation stops early if even adding this upper limit to the best score in the current row cannot
+        # yield a distance within the cutoff.
         needleman_wunsch_kernel = cp.RawKernel(
             r"""
         extern "C" __global__ __launch_bounds__(256)
@@ -1958,18 +1967,15 @@ class GPUNeedlemanWunschDistanceCalculator(NeedlemanWunschDistanceCalculator):
             const int* __restrict__ self_scores1,
             const int* __restrict__ self_scores2,
             const int* __restrict__ substitution_matrix,
-            int* __restrict__ dp_rows,
             const int alphabet_size,
             const int gap_penalty,
-            const int band_width,
             const int cutoff,
             int* __restrict__ data,
             int* __restrict__ indices,
             int* __restrict__ row_element_counts,
             const int seqs_mat1_rows,
             const int seqs_mat2_rows,
-            const int buffer_width,
-            const int dp_stride
+            const int buffer_width
         ) {
             int row = blockDim.x * blockIdx.x + threadIdx.x;
             if (row >= seqs_mat1_rows) {
@@ -1980,40 +1986,46 @@ class GPUNeedlemanWunschDistanceCalculator(NeedlemanWunschDistanceCalculator):
             int row_end_index = 0;
             for (int col = length_starts[seq1_len]; col < length_ends[seq1_len]; col++) {
                 int seq2_len = seqs_L2[col];
-                for (int j = 0; j <= min(band_width, seq2_len); j++) {
-                    dp_rows[(long long)j * dp_stride + row] = -j * gap_penalty;
-                }
                 int required_score = min(self_scores1[row], self_scores2[col]) - cutoff;
                 int remaining_max_score = self_scores1[row];
                 bool cutoff_unreachable = false;
+                const int unreachable = (-2147483647 - 1);
+                // Compile-time indices and unrolling allow the compiler to keep small dynamic programming bands in registers.
+                constexpr int band_size = 2 * BAND_WIDTH + 1;
+                int band[band_size];
+                #pragma unroll
+                for (int k = 0; k < band_size; k++) {
+                    int j = k - BAND_WIDTH;
+                    band[k] = (j >= 0 && j <= seq2_len) ? -j * gap_penalty : unreachable;
+                }
                 for (int i = 1; i <= seq1_len; i++) {
-                    int band_start = i - band_width;
-                    int band_end = i + band_width;
-                    int j_start = max(1, band_start);
-                    int j_end = min(seq2_len, band_end);
-                    int diagonal = dp_rows[(long long)(j_start - 1) * dp_stride + row];
-                    int left = -i * gap_penalty;
-                    if (i <= band_width) {
-                        dp_rows[row] = left;
-                    }
                     int aa1 = seqs_mat1[(long long)(i - 1) * seqs_mat1_rows + row];
                     int aa1_self_score = substitution_matrix[aa1 * alphabet_size + aa1];
                     remaining_max_score -= aa1_self_score;
-                    int row_max_score = (i <= band_width) ? left : (-2147483647 - 1);
-                    for (int j = j_start; j <= j_end; j++) {
-                        int aa2 = seqs_mat2[(long long)(j - 1) * seqs_mat2_rows + col];
-                        int best = diagonal + substitution_matrix[aa1 * alphabet_size + aa2];
-                        // The upper neighbor lies outside the previous band at its right edge.
-                        int above = 0;
-                        if (j < band_end) {
-                            above = dp_rows[(long long)j * dp_stride + row];
-                            best = max(best, above - gap_penalty);
+                    int row_max_score = unreachable;
+                    int left = unreachable;
+                    #pragma unroll
+                    for (int k = 0; k < band_size; k++) {
+                        int j = i - BAND_WIDTH + k;
+                        int best = unreachable;
+                        if (j == 0) {
+                            best = -i * gap_penalty;
+                        } else if (j > 0 && j <= seq2_len) {
+                            int aa2 = seqs_mat2[(long long)(j - 1) * seqs_mat2_rows + col];
+                            if (band[k] != unreachable) {
+                                best = band[k] + substitution_matrix[aa1 * alphabet_size + aa2];
+                            }
+                            if (k + 1 < band_size) {
+                                if (band[k + 1] != unreachable) {
+                                    best = max(best, band[k + 1] - gap_penalty);
+                                }
+                            }
+                            if (left != unreachable) {
+                                best = max(best, left - gap_penalty);
+                            }
                         }
-                        if (j > band_start) {
-                            best = max(best, left - gap_penalty);
-                        }
-                        dp_rows[(long long)j * dp_stride + row] = best;
-                        diagonal = above;
+                        // The old value at k + 1 is still available for the next position.
+                        band[k] = best;
                         left = best;
                         row_max_score = max(row_max_score, best);
                     }
@@ -2024,10 +2036,16 @@ class GPUNeedlemanWunschDistanceCalculator(NeedlemanWunschDistanceCalculator):
                         break;
                     }
                 }
+                int score = unreachable;
+                #pragma unroll
+                for (int k = 0; k < band_size; k++) {
+                    if (k == seq2_len - seq1_len + BAND_WIDTH) {
+                        score = band[k];
+                    }
+                }
                 if (cutoff_unreachable) {
                     continue;
                 }
-                int score = dp_rows[(long long)seq2_len * dp_stride + row];
                 int distance = max(0, min(self_scores1[row], self_scores2[col]) - score) + 1;
                 if (distance <= cutoff + 1) {
                     if (row_end_index < buffer_width) {
@@ -2041,6 +2059,7 @@ class GPUNeedlemanWunschDistanceCalculator(NeedlemanWunschDistanceCalculator):
         }
         """,
             "needleman_wunsch_kernel",
+            options=(f"-DBAND_WIDTH={band_width}",),
         )
 
         create_csr_kernel = cp.RawKernel(
@@ -2117,10 +2136,8 @@ class GPUNeedlemanWunschDistanceCalculator(NeedlemanWunschDistanceCalculator):
                         d_self_scores1,
                         d_self_scores2,
                         d_substitution_matrix,
-                        d_dp_rows,
                         substitution_matrix.shape[0],
                         self.gap_penalty,
-                        band_width,
                         self.cutoff,
                         d_data_matrix,
                         d_indices_matrix,
@@ -2128,7 +2145,6 @@ class GPUNeedlemanWunschDistanceCalculator(NeedlemanWunschDistanceCalculator):
                         seqs_mat1_rows,
                         seqs_mat2_rows,
                         buffer_width,
-                        d_dp_rows.shape[1],
                     ),
                 )
                 row_element_counts = d_row_element_counts.get()

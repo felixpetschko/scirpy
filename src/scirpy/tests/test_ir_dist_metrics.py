@@ -1424,6 +1424,18 @@ def test_gpu_hamming_reference(kwargs):
             (np.array(["AW", "CW", "WW", "AX"]), np.array(["CW", "AW", "W", "XX"])),
             np.array([[5, 1, 5, 1], [1, 5, 5, 1], [0, 0, 5, 1], [5, 1, 0, 1]]),
         ),
+        # The five-position register band preserves matches and two-residue gaps exactly at the cutoff.
+        (
+            {"cutoff": 8, "gpu_tile_rows": 2, "gpu_tile_cols": 3, "gpu_tile_buffer_cols": 1},
+            (np.array(["AAAA", "CCAA", "WWWW"]), np.array(["AAAA", "CCAA", "AAAAAA", "WAAA"])),
+            np.array([[1, 9, 9, 8], [9, 1, 0, 0], [0, 0, 0, 0]]),
+        ),
+        # The register band retains late high-scoring matches and neutral unknown symbols.
+        (
+            {"cutoff": 8, "gpu_tile_rows": 2, "gpu_tile_cols": 3, "gpu_tile_buffer_cols": 1},
+            (np.array(["AW", "CW", "WW", "AX"]), np.array(["CW", "AW", "W", "XX"])),
+            np.array([[5, 1, 5, 1], [1, 5, 5, 1], [0, 8, 5, 1], [5, 1, 9, 1]]),
+        ),
     ],
 )
 def test_gpu_needleman_wunsch(test_parameters, test_input, expected_result):
@@ -1459,6 +1471,11 @@ def test_gpu_needleman_wunsch_buffer_retry():
         (4, 7),
         # Two gap positions are allowed exactly at the cutoff boundary.
         (4, 8),
+        # Wider compile-time bands retain the same distances as the CPU implementation.
+        (4, 16),
+        (4, 32),
+        # A band wider than both sequences is equivalent to the full alignment matrix.
+        (4, 128),
         # Free gaps require evaluating the full alignment matrix.
         (0, 10),
     ],
