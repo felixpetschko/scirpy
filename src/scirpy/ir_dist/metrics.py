@@ -1983,6 +1983,9 @@ class GPUNeedlemanWunschDistanceCalculator(NeedlemanWunschDistanceCalculator):
                 for (int j = 0; j <= min(band_width, seq2_len); j++) {
                     dp_rows[(long long)j * dp_stride + row] = -j * gap_penalty;
                 }
+                int required_score = min(self_scores1[row], self_scores2[col]) - cutoff;
+                int remaining_score = self_scores1[row];
+                bool excluded = false;
                 for (int i = 1; i <= seq1_len; i++) {
                     int band_start = i - band_width;
                     int band_end = i + band_width;
@@ -1994,6 +1997,8 @@ class GPUNeedlemanWunschDistanceCalculator(NeedlemanWunschDistanceCalculator):
                         dp_rows[row] = left;
                     }
                     int aa1 = seqs_mat1[(long long)(i - 1) * seqs_mat1_rows + row];
+                    remaining_score -= substitution_matrix[aa1 * alphabet_size + aa1];
+                    int row_max_score = (i <= band_width) ? left : (-2147483647 - 1);
                     for (int j = j_start; j <= j_end; j++) {
                         int aa2 = seqs_mat2[(long long)(j - 1) * seqs_mat2_rows + col];
                         int best = diagonal + substitution_matrix[aa1 * alphabet_size + aa2];
@@ -2009,7 +2014,17 @@ class GPUNeedlemanWunschDistanceCalculator(NeedlemanWunschDistanceCalculator):
                         dp_rows[(long long)j * dp_stride + row] = best;
                         diagonal = above;
                         left = best;
+                        row_max_score = max(row_max_score, best);
                     }
+                    // Self-match scores bound the contribution of the remaining residues from above.
+                    // Stop only if even this best-case alignment would exceed the distance cutoff.
+                    if (row_max_score + remaining_score < required_score) {
+                        excluded = true;
+                        break;
+                    }
+                }
+                if (excluded) {
+                    continue;
                 }
                 int score = dp_rows[(long long)seq2_len * dp_stride + row];
                 int distance = max(0, min(self_scores1[row], self_scores2[col]) - score) + 1;
